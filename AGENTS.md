@@ -42,6 +42,20 @@ Use [clap](https://docs.rs/clap) with clap's derive API (`Parser`,
 `Args`, `Subcommand`, and related derives) for Rust CLI patterns. Do not
 parse `std::env::args` by hand when clap can express the interface.
 
+## MCP and RMCP
+
+Use [rmcp](https://crates.io/crates/rmcp) for MCP support in this Rust
+codebase. Do not introduce another MCP Rust stack unless a change
+explicitly requires it.
+
+When answering or implementing MCP protocol behavior, look for a
+`model-context-protocol-reference` skill, or a similarly named MCP
+specification skill. If one is present, use it. If none is present,
+confirm MCP facts from
+[the protocol repository](https://github.com/modelcontextprotocol/modelcontextprotocol)
+or [modelcontextprotocol.io](https://modelcontextprotocol.io). Do not
+treat memory of the protocol as sufficient for normative claims.
+
 ## Protobuf and buffa
 
 Protobuf is our IDL. Use the [buffa](https://github.com/anthropics/buffa)
