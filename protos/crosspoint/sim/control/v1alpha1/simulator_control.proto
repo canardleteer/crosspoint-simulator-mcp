@@ -1,0 +1,245 @@
+syntax = "proto3";
+
+package crosspoint.sim.control.v1alpha1;
+
+import "google/protobuf/field_mask.proto";
+
+// Who applied a user-interaction edge reported on InputObserved.
+enum InputSource {
+  // Source was not set; do not treat as a real edge.
+  INPUT_SOURCE_UNSPECIFIED = 0;
+  // Keyboard, mouse, or window events from a person at the simulator UI.
+  INPUT_SOURCE_HUMAN = 1;
+  // Inject from this control session.
+  INPUT_SOURCE_REMOTE = 2;
+  // Env-script synthetic input on the simulator.
+  INPUT_SOURCE_SCRIPT = 3;
+}
+
+// Identity and device profile sent once when the stream opens.
+message Register {
+  // Unique id for this simulator process (caller-chosen or generated).
+  string instance_id = 1;
+  // Board profile: x4, x3, x4_pro, or sticky.
+  string board_id = 2;
+  // Display controller id: ssd1677, uc8179, uc8279, or similar.
+  string controller = 3;
+  // Panel width in pixels.
+  uint32 width = 4;
+  // Panel height in pixels.
+  uint32 height = 5;
+  // True when the profile has a touch surface.
+  bool cap_touch = 6;
+  // True when the profile has a Home key.
+  bool cap_home = 7;
+  // True when the profile has a frontlight.
+  bool cap_frontlight = 8;
+  // OS process id of the simulator.
+  uint32 pid = 9;
+  // Simulator or firmware version string.
+  string version = 10;
+}
+
+// Periodic liveness from the simulator client.
+message Heartbeat {
+  // Increments when the framebuffer is redrawn.
+  uint64 framebuffer_generation = 1;
+  // Whether remote inject is currently accepted.
+  bool inject_enabled = 2;
+  // True when local human input is off.
+  bool headless = 3;
+}
+
+// Ask the simulator to capture the panel (or a crop of it).
+message SnapshotRequest {
+  // When true, crop using x, y, width, and height.
+  bool region = 1;
+  // Crop origin x, in panel pixels.
+  uint32 x = 2;
+  // Crop origin y, in panel pixels.
+  uint32 y = 3;
+  // Crop width, in panel pixels.
+  uint32 width = 4;
+  // Crop height, in panel pixels.
+  uint32 height = 5;
+  // Encoded format; 0 is PNG with a device-appropriate palette.
+  uint32 format = 6;
+}
+
+// Encoded panel image for a SnapshotRequest.
+message SnapshotFrame {
+  // Encoded image bytes (not base64).
+  bytes pixels = 1;
+  // MIME type of pixels; typically image/png.
+  string mime_type = 2;
+  // Hash of the encoded image.
+  string hash = 3;
+  // Framebuffer generation at capture time.
+  uint64 generation = 4;
+  // Image width in pixels.
+  uint32 width = 5;
+  // Image height in pixels.
+  uint32 height = 6;
+}
+
+// Snapshot failed; corr on the envelope matches the request.
+message SnapshotError {
+  // Human-readable failure reason.
+  string message = 1;
+}
+
+// Inject a touch edge or a tap on the panel.
+message InjectTouch {
+  // 0=down, 1=move, 2=up, 3=tap.
+  uint32 kind = 1;
+  // Touch x in panel pixels.
+  uint32 x = 2;
+  // Touch y in panel pixels.
+  uint32 y = 3;
+}
+
+// Inject a named device key.
+message InjectKey {
+  // Key name: BACK, ENTER, LEFT, RIGHT, UP, DOWN, POWER, SLEEP, or QUIT.
+  string name = 1;
+  // Hold duration in milliseconds; 0 means the default 80.
+  uint32 hold_ms = 2;
+}
+
+// Inject the Home key when the registered profile has it.
+message InjectHome {
+  // Hold duration in milliseconds.
+  uint32 hold_ms = 1;
+}
+
+// Inject a swipe as down at start, travel, and up at end.
+message InjectSwipe {
+  // Start x in panel pixels.
+  uint32 start_x = 1;
+  // Start y in panel pixels.
+  uint32 start_y = 2;
+  // End x in panel pixels.
+  uint32 end_x = 3;
+  // End y in panel pixels.
+  uint32 end_y = 4;
+  // Duration of the swipe in milliseconds.
+  uint32 duration_ms = 5;
+}
+
+// Enable or disable remote inject on the simulator.
+message SetInjectEnabled {
+  // When false, remote injects are not applied.
+  bool enabled = 1;
+}
+
+// Ask the simulator process to shut down. No fields.
+message ShutdownRequest {}
+
+// Reply to a server item that set ack_requested.
+message InputAck {
+  // True when the inject was accepted.
+  bool accepted = 1;
+  // Why it was rejected, for example queue_full or inject_disabled.
+  string reason = 2;
+}
+
+// Uniform report of an applied user-interaction edge.
+message InputObserved {
+  // Who applied the edge: a person at the UI, remote, or script.
+  InputSource source = 1;
+  // Exactly one edge kind.
+  oneof event {
+    // Device key press or release.
+    KeyEdge key = 10;
+    // Touch down, move, or up.
+    TouchEdge touch = 11;
+    // Home key press or release.
+    HomeEdge home = 12;
+    // Host sleep or quit (not a firmware key).
+    HostEdge host = 13;
+  }
+}
+
+// Device key edge (not Home, sleep, or quit).
+message KeyEdge {
+  // Key name: BACK, ENTER, LEFT, RIGHT, UP, DOWN, or POWER.
+  string name = 1;
+  // True on press, false on release.
+  bool down = 2;
+}
+
+// Touch edge in normalized panel coordinates.
+message TouchEdge {
+  // 0=down, 1=move, 2=up.
+  uint32 kind = 1;
+  // Normalized x in 0..1.
+  float nx = 2;
+  // Normalized y in 0..1.
+  float ny = 3;
+}
+
+// Home key edge, only when the profile has Home.
+message HomeEdge {
+  // True on press, false on release.
+  bool down = 1;
+}
+
+// Host-only power or close edge, not a firmware key.
+message HostEdge {
+  // 0=sleep, 1=quit.
+  uint32 kind = 1;
+}
+
+// Class of a teed log line.
+enum LogType {
+  // Type was not set; prefer classifying over dropping.
+  LOG_TYPE_UNSPECIFIED = 0;
+  // Firmware Serial / HWCDC on stderr.
+  LOG_TYPE_FIRMWARE_SERIAL = 1;
+  // Host [SIM] diagnostics.
+  LOG_TYPE_HOST_SIM = 2;
+  // Control-session client thread.
+  LOG_TYPE_CONTROL_PLANE = 3;
+}
+
+// Severity of a teed log line.
+enum LogSeverity {
+  // Severity was not set.
+  LOG_SEVERITY_UNSPECIFIED = 0;
+  // Debug.
+  LOG_SEVERITY_DEBUG = 1;
+  // Informational.
+  LOG_SEVERITY_INFO = 2;
+  // Warning.
+  LOG_SEVERITY_WARN = 3;
+  // Error.
+  LOG_SEVERITY_ERROR = 4;
+}
+
+// Session-level AEP-161 read mask over SimToServer payload names.
+// Empty means emit everything. Not a LogType allowlist.
+message SetSessionView {
+  // Paths are SimToServer payload names (register, heartbeat, snapshot,
+  // log, input_observed, and the other oneof members).
+  google.protobuf.FieldMask read_mask = 1;
+}
+
+// One classifiable log line from the simulator.
+message LogLine {
+  // Sequence number for log lines.
+  uint64 seq = 1;
+  // Line class (firmware serial, host sim, or control plane).
+  LogType type = 2;
+  // Line severity.
+  LogSeverity severity = 3;
+  // Informational component name; not a filter key.
+  string component = 4;
+  // Line text.
+  string text = 5;
+}
+
+// The client is closing the stream.
+message Goodbye {
+  // Why the stream is closing.
+  string reason = 1;
+}

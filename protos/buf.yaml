@@ -1,0 +1,36 @@
+# Workspace root for CrossPoint simulator wire APIs.
+# Packages live under <org>/<area>/<surface>/<version>/, matching
+# `crosspoint.sim.control.v1alpha1` and later siblings.
+version: v2
+
+# Workspace defaults apply to every module that does not override them.
+# STANDARD includes SERVICE_SUFFIX; unary RPCs must use MethodRequest /
+# MethodResponse. The bidirectional Session envelopes keep directional
+# names, so only session.proto ignores those two rules.
+lint:
+  use:
+    - STANDARD
+    - COMMENTS
+  ignore_only:
+    RPC_REQUEST_STANDARD_NAME:
+      - crosspoint/sim/control/v1alpha1/session.proto
+    RPC_RESPONSE_STANDARD_NAME:
+      - crosspoint/sim/control/v1alpha1/session.proto
+
+breaking:
+  use:
+    - FILE
+
+modules:
+  # v1alpha1 is its own module so ignore_unstable_packages applies only
+  # to this iteration. Set the flag to false to start enforcing breaking
+  # checks on v1alpha1. Add a sibling module (same path, includes:
+  # crosspoint/sim/control/v1alpha2, or another package directory) with
+  # the flag unset so that package is checked.
+  - path: .
+    includes:
+      - crosspoint/sim/control/v1alpha1
+    breaking:
+      use:
+        - FILE
+      ignore_unstable_packages: true

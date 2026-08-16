@@ -1,0 +1,69 @@
+syntax = "proto3";
+
+package crosspoint.sim.control.v1alpha1;
+
+import "crosspoint/sim/control/v1alpha1/simulator_control.proto";
+
+// Bidirectional control session. The eBook firmware simulator is the
+// client and dials this server; the server does not unary-call back.
+service SimulatorControlService {
+  // Open a process-lifetime stream. Re-open after disconnect; a new
+  // process is a new instance unless it presents the same id.
+  rpc Session(stream SimToServer) returns (stream ServerToSim);
+}
+
+// Client-to-server envelope on the bidirectional Session stream.
+// Directional names are intentional; this file is ignored for
+// RPC_REQUEST_STANDARD_NAME / RPC_RESPONSE_STANDARD_NAME.
+message SimToServer {
+  // Monotonic sequence number for this process.
+  uint64 seq = 1;
+  // Echo of ServerToSim.corr when this message replies to a server item.
+  uint64 corr = 2;
+  // Exactly one payload per envelope.
+  oneof payload {
+    // First message on a new stream: identity and device profile.
+    Register register = 10;
+    // Periodic liveness and framebuffer generation.
+    Heartbeat heartbeat = 11;
+    // Encoded panel capture for a SnapshotRequest.
+    SnapshotFrame snapshot = 12;
+    // Failed snapshot; corr matches the request.
+    SnapshotError snapshot_error = 13;
+    // One classifiable log line.
+    LogLine log = 14;
+    // Reply to a server item that set ack_requested.
+    InputAck input_ack = 15;
+    // Applied user-interaction edge (human, remote, or script).
+    InputObserved input_observed = 16;
+    // Stream is closing.
+    Goodbye goodbye = 17;
+  }
+}
+
+// Server-to-client envelope on the bidirectional Session stream.
+message ServerToSim {
+  // Correlation id the client echoes on replies.
+  uint64 corr = 1;
+  // When true, the client must reply with InputAck.
+  bool ack_requested = 2;
+  // Exactly one payload per envelope.
+  oneof payload {
+    // Inject a touch edge or tap.
+    InjectTouch inject_touch = 10;
+    // Inject a named device key.
+    InjectKey inject_key = 11;
+    // Inject the Home key when the profile has it.
+    InjectHome inject_home = 12;
+    // Inject a swipe as down, travel, and up.
+    InjectSwipe inject_swipe = 13;
+    // Request a PNG capture of the panel.
+    SnapshotRequest snapshot_request = 14;
+    // Enable or disable remote inject.
+    SetInjectEnabled set_inject_enabled = 15;
+    // Ask the simulator process to shut down.
+    ShutdownRequest shutdown = 16;
+    // Session-level field mask of SimToServer payloads to emit.
+    SetSessionView set_session_view = 17;
+  }
+}
