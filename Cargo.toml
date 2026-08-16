@@ -1,0 +1,16 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+default-members = ["crates/csm-proxy"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+buffa = { version = "0.9.1", features = ["json"] }
+buffa-types = { version = "0.9.1", features = ["json"] }
+buf-tools = "1.72.0"
+clap = { version = "4.6.6", features = ["derive"] }
+csm-pb-bindings = { path = "crates/csm-pb-bindings" }
+serde = { version = "1", features = ["derive"] }

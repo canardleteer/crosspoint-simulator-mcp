@@ -1,0 +1,12 @@
+[package]
+name = "csm-pb-bindings"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+buffa.workspace = true
+buffa-types.workspace = true
+serde.workspace = true
+
+[build-dependencies]
+buf-tools.workspace = true

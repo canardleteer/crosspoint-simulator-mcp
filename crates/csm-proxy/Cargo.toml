@@ -1,0 +1,13 @@
+[package]
+name = "csm-proxy"
+version.workspace = true
+edition.workspace = true
+autobins = false
+
+[[bin]]
+name = "crosspoint-simulator-mcp-proxy"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+csm-pb-bindings.workspace = true

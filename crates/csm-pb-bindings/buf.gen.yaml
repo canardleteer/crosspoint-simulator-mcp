@@ -1,0 +1,9 @@
+version: v2
+inputs:
+  - directory: ../../protos
+plugins:
+  - remote: buf.build/anthropics/buffa:v0.9.1
+    out: src/gen
+    opt:
+      - file_per_package=true
+      - json=true
