@@ -168,6 +168,16 @@ the workspace `Cargo.toml` (`buffa` for the buffa plugin, `connectrpc`
 for the connect-rust plugin). connectrpc 0.8 depends on buffa 0.8.x, so
 this workspace stays on that buffa minor until connectrpc adopts 0.9.
 
+A second Buf template, [`protos/buf.gen.sim-cpp.yaml`](protos/buf.gen.sim-cpp.yaml),
+emits C++ protobuf and grpc++ stubs into the `crosspoint-simulator`
+submodule at `src/sim_grpc/gen`. That generate file lives in this
+repository for now and will move later. Run
+`cargo xtask generate-sim-cpp`. It uses the host `protoc` built-in C++
+plugin and `grpc_cpp_plugin` on `PATH` so the stubs match the
+protobuf/grpc++ libraries the simulator links. The simulator commits
+those outputs and does not need the `.proto` files to build. Do not run
+this generate from `csm-pb-bindings`'s `build.rs`.
+
 Workspace-level generate rules (where to run Buf, what not to vendor)
 are in [`protos/AGENTS.md`](protos/AGENTS.md).
 

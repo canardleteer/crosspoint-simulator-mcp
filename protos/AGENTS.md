@@ -47,7 +47,10 @@ This directory is the Buf workspace. Run `buf lint` and `buf generate`
 from here. Do not check in generated stubs as the source of truth; the
 `.proto` files are. How this repository invokes Buf and which plugin
 emits Rust is in the root [`AGENTS.md`](../AGENTS.md) under
-**Generating protobuf bindings**.
+**Generating protobuf bindings**. C++ / grpc++ stubs for the simulator
+use [`buf.gen.sim-cpp.yaml`](buf.gen.sim-cpp.yaml) via
+`cargo xtask generate-sim-cpp` and are committed in the submodule, not
+here.
 
 ## Agent Documentation Standards
 

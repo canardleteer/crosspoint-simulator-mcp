@@ -5,5 +5,6 @@ edition.workspace = true
 publish = false
 
 [dependencies]
+buf-tools.workspace = true
 clap.workspace = true
 serde_json = "1"

@@ -31,6 +31,8 @@ struct Args {
 enum Task {
     /// Run tests with LLVM coverage and require more than 90% line cover.
     Coverage(CoverageArgs),
+    /// Generate C++ protobuf and grpc++ stubs into the simulator submodule.
+    GenerateSimCpp,
 }
 
 #[derive(clap::Args, Debug)]
@@ -135,6 +137,44 @@ fn html_index(out_dir: &Path) -> PathBuf {
     }
 }
 
+fn run_generate_sim_cpp() -> Result<(), String> {
+    let root = workspace_root();
+    let protos = root.join("protos");
+    let template = protos.join("buf.gen.sim-cpp.yaml");
+    let out = root.join("crosspoint-simulator/src/sim_grpc/gen");
+    fs::create_dir_all(&out).map_err(|e| e.to_string())?;
+
+    if Command::new("sh")
+        .args(["-c", "command -v grpc_cpp_plugin"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| !s.success())
+        .unwrap_or(true)
+    {
+        return Err(
+            "grpc_cpp_plugin not found on PATH. Install protobuf-compiler-grpc \
+             (and libgrpc++-dev / libprotobuf-dev) or add a local gRPC prefix \
+             to PATH, then re-run cargo xtask generate-sim-cpp."
+                .into(),
+        );
+    }
+
+    let buf = buf_tools::buf_bin_path();
+    let status = Command::new(&buf)
+        .arg("generate")
+        .arg("--template")
+        .arg(&template)
+        .current_dir(&protos)
+        .status()
+        .map_err(|e| format!("failed to spawn buf generate: {e}"))?;
+    if !status.success() {
+        return Err(format!("buf generate failed ({status})"));
+    }
+    println!("wrote C++ Session stubs under {}", out.display());
+    Ok(())
+}
+
 fn run_coverage(args: CoverageArgs) -> Result<(), String> {
     if tool_missing() {
         return Err(INSTALL_HINT.trim_end().to_string());
@@ -208,6 +248,7 @@ fn main() -> ExitCode {
     let args = Args::parse();
     let result = match args.command {
         Task::Coverage(coverage) => run_coverage(coverage),
+        Task::GenerateSimCpp => run_generate_sim_cpp(),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

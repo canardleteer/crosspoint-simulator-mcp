@@ -1,0 +1,10 @@
+# Use the host protoc and grpc_cpp_plugin so deposited stubs match the
+# protobuf/grpc++ libraries the simulator links (Ubuntu 24.04: 3.21 / 1.51,
+# or a local prefix on PATH / PKG_CONFIG_PATH). Remote C++ plugins emit a
+# newer protobuf major than those packages provide.
+version: v2
+plugins:
+  - protoc_builtin: cpp
+    out: ../crosspoint-simulator/src/sim_grpc/gen
+  - local: grpc_cpp_plugin
+    out: ../crosspoint-simulator/src/sim_grpc/gen
