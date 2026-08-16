@@ -43,6 +43,27 @@ Use [clap](https://docs.rs/clap) with clap's derive API (`Parser`,
 `Args`, `Subcommand`, and related derives) for Rust CLI patterns. Do not
 parse `std::env::args` by hand when clap can express the interface.
 
+Workspace maintenance lives in the `xtask` crate. Run it as
+`cargo xtask <command>` (see `.cargo/config.toml`).
+
+## Coverage
+
+Line coverage for this repository's own Rust must stay **over 90%**.
+That measurement excludes generated bindings under `src/gen` and
+`src/gen_connect`, and excludes the `xtask` crate. Check with:
+
+```bash
+cargo xtask coverage
+```
+
+`cargo xtask coverage --html` also writes an HTML report under
+`target/llvm-cov/html`. `cargo xtask coverage --open` writes that
+report and opens it in the default browser.
+
+If coverage tools are missing, the xtask prints `cargo install` (and
+`rustup component add`) commands. Do not land a change that drops line
+coverage to 90% or below.
+
 ## MCP and RMCP
 
 Use [rmcp](https://crates.io/crates/rmcp) for MCP support in this Rust

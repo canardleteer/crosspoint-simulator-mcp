@@ -200,3 +200,111 @@ impl InboundSink {
         self.queue.push(msg);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use csm_pb_bindings::generated::crosspoint::sim::control::v1alpha1::ShutdownRequest;
+
+    fn register(id: &str) -> Register {
+        Register {
+            instance_id: id.into(),
+            ..Default::default()
+        }
+    }
+
+    fn inbound(seq: u64) -> SimToServer {
+        SimToServer {
+            seq,
+            ..Default::default()
+        }
+    }
+
+    fn outbound(corr: u64) -> ServerToSim {
+        ServerToSim {
+            corr,
+            payload: Some(ShutdownRequest::default().into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn default_map_is_empty() {
+        let map = InstanceMap::default();
+        assert!(map.list().is_empty());
+        assert!(map.get("missing").is_none());
+        assert!(!map.owns("missing", 1));
+        assert_eq!(
+            map.try_send("missing", outbound(1)),
+            Err(TrySendError::UnknownInstance)
+        );
+        assert!(map.try_recv_inbound("missing").is_none());
+    }
+
+    #[test]
+    fn insert_owns_and_replace() {
+        let map = InstanceMap::new();
+        let (tx, _rx) = mpsc::channel(1);
+        let (token, _sink) = map.insert(register("a"), 4, tx);
+        assert!(map.owns("a", token));
+        assert!(!map.owns("a", token + 1));
+        assert_eq!(map.list(), vec!["a".to_string()]);
+        assert_eq!(map.get("a").unwrap().register.instance_id, "a");
+
+        let (tx2, _rx2) = mpsc::channel(1);
+        let (token2, _sink2) = map.insert(register("a"), 4, tx2);
+        assert_ne!(token, token2);
+        assert!(map.owns("a", token2));
+        assert!(!map.owns("a", token));
+    }
+
+    #[test]
+    fn heartbeat_and_remove_respect_token() {
+        let map = InstanceMap::new();
+        let (tx, _rx) = mpsc::channel(1);
+        let (token, _sink) = map.insert(register("a"), 4, tx);
+        let hb = Heartbeat {
+            framebuffer_generation: 3,
+            inject_enabled: true,
+            ..Default::default()
+        };
+        map.set_heartbeat("a", token + 1, hb.clone());
+        assert!(map.get("a").unwrap().last_heartbeat.is_none());
+        map.set_heartbeat("a", token, hb);
+        assert_eq!(
+            map.get("a")
+                .unwrap()
+                .last_heartbeat
+                .unwrap()
+                .framebuffer_generation,
+            3
+        );
+
+        map.remove_if("a", token + 1);
+        assert!(map.get("a").is_some());
+        map.remove_if("a", token);
+        assert!(map.get("a").is_none());
+    }
+
+    #[test]
+    fn inbound_drops_oldest_when_full() {
+        let map = InstanceMap::new();
+        let (tx, _rx) = mpsc::channel(1);
+        let (_token, sink) = map.insert(register("q"), 2, tx);
+        sink.push(inbound(1));
+        sink.push(inbound(2));
+        sink.push(inbound(3));
+        assert_eq!(map.try_recv_inbound("q").unwrap().seq, 2);
+        assert_eq!(map.try_recv_inbound("q").unwrap().seq, 3);
+        assert!(map.try_recv_inbound("q").is_none());
+    }
+
+    #[test]
+    fn outbound_try_send_and_queue_full() {
+        let map = InstanceMap::new();
+        let (tx, _rx) = mpsc::channel(1);
+        let (_token, _sink) = map.insert(register("q"), 2, tx);
+        map.try_send("q", outbound(1)).unwrap();
+        assert_eq!(map.try_send("q", outbound(2)), Err(TrySendError::QueueFull));
+    }
+}

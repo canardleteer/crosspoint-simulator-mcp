@@ -6,7 +6,7 @@ use std::time::Duration;
 use connectrpc::client::{ClientConfig, HttpClient};
 use connectrpc::{Protocol, Server};
 use csm_pb_bindings::generated::crosspoint::sim::control::v1alpha1::{
-    Heartbeat, Register, ServerToSim, ShutdownRequest, SimToServer,
+    Goodbye, Heartbeat, LogLine, Register, ServerToSim, ShutdownRequest, SimToServer,
 };
 use csm_pb_bindings::rpc::crosspoint::sim::control::v1alpha1::SimulatorControlServiceClient;
 use csm_proxy::{InstanceMap, QUEUE_CAPACITY, SessionService, TrySendError};
@@ -34,6 +34,34 @@ fn heartbeat_msg(generation: u64) -> SimToServer {
                 framebuffer_generation: generation,
                 inject_enabled: true,
                 headless: false,
+                ..Default::default()
+            }
+            .into(),
+        ),
+        ..Default::default()
+    }
+}
+
+fn goodbye_msg() -> SimToServer {
+    SimToServer {
+        seq: 3,
+        payload: Some(
+            Goodbye {
+                reason: "done".into(),
+                ..Default::default()
+            }
+            .into(),
+        ),
+        ..Default::default()
+    }
+}
+
+fn log_msg(seq: u64) -> SimToServer {
+    SimToServer {
+        seq,
+        payload: Some(
+            LogLine {
+                text: "line".into(),
                 ..Default::default()
             }
             .into(),
@@ -206,4 +234,110 @@ async fn outbound_try_send_fails_when_full() {
         Err(TrySendError::QueueFull)
     );
     session.close_send();
+}
+
+#[tokio::test]
+async fn empty_stream_is_rejected() {
+    let (addr, instances) = start_listener().await;
+    let client = grpc_client(addr);
+    let mut session = client.session().await.expect("open Session");
+    session.close_send();
+    drop(session);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(instances.list().is_empty());
+}
+
+#[tokio::test]
+async fn first_message_must_be_register() {
+    let (addr, instances) = start_listener().await;
+    let client = grpc_client(addr);
+    let mut session = client.session().await.expect("open Session");
+    let _ = session.send(heartbeat_msg(1)).await;
+    session.close_send();
+    drop(session);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(instances.list().is_empty());
+}
+
+#[tokio::test]
+async fn empty_instance_id_is_rejected() {
+    let (addr, instances) = start_listener().await;
+    let client = grpc_client(addr);
+    let mut session = client.session().await.expect("open Session");
+    let _ = session.send(register_msg("")).await;
+    session.close_send();
+    drop(session);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(instances.list().is_empty());
+}
+
+#[tokio::test]
+async fn long_instance_id_is_rejected() {
+    let (addr, instances) = start_listener().await;
+    let client = grpc_client(addr);
+    let mut session = client.session().await.expect("open Session");
+    let _ = session.send(register_msg(&"x".repeat(65))).await;
+    session.close_send();
+    drop(session);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(instances.list().is_empty());
+}
+
+#[tokio::test]
+async fn goodbye_removes_the_instance() {
+    let (addr, instances) = start_listener().await;
+    let client = grpc_client(addr);
+    let mut session = client.session().await.expect("open Session");
+    session
+        .send(register_msg("sim-bye"))
+        .await
+        .expect("send Register");
+    wait_until(|| instances.get("sim-bye").is_some()).await;
+    session.send(goodbye_msg()).await.expect("send Goodbye");
+    wait_until(|| instances.get("sim-bye").is_none()).await;
+    session.close_send();
+}
+
+#[tokio::test]
+async fn later_envelopes_land_on_the_inbound_queue() {
+    let (addr, instances) = start_listener().await;
+    let client = grpc_client(addr);
+    let mut session = client.session().await.expect("open Session");
+    session
+        .send(register_msg("sim-in"))
+        .await
+        .expect("send Register");
+    wait_until(|| instances.get("sim-in").is_some()).await;
+    session.send(log_msg(4)).await.expect("send LogLine");
+    wait_until(|| instances.try_recv_inbound("sim-in").is_some()).await;
+    session.close_send();
+}
+
+#[tokio::test]
+async fn serve_accepts_a_register() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("pick port");
+    let addr = listener.local_addr().expect("local addr");
+    drop(listener);
+
+    let instances = InstanceMap::new();
+    let server = tokio::spawn(csm_proxy::serve(addr, instances.clone()));
+    let client = grpc_client(addr);
+    let mut session = None;
+    for _ in 0..50 {
+        if let Ok(opened) = client.session().await {
+            session = Some(opened);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let mut session = session.expect("serve accepted Session");
+    session
+        .send(register_msg("via-serve"))
+        .await
+        .expect("send Register");
+    wait_until(|| instances.get("via-serve").is_some()).await;
+    session.close_send();
+    server.abort();
 }
