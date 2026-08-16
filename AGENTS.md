@@ -3,6 +3,9 @@
 This file is a README for agents: the extra context that helps coding agents
 work in this repository.
 
+`csm` abbreviates **crosspoint-simulator-mcp**. Rust packages live under
+`crates/<crate-name>` and use that prefix (`csm-proxy`, `csm-pb-bindings`).
+
 ## What this repo is
 
 An MCP server that lets a host application control and observe an eBook
@@ -29,12 +32,22 @@ The submodule tracks
 `dev/canardleteer/agent-docs-host-platforms`. After clone, initialize it with
 `git submodule update --init --recursive`.
 
-## Protobuf, buffa, and Buf
+## Rust crates and CLI
 
-Protobuf is our IDL. This crate uses the
-[buffa](https://github.com/anthropics/buffa) ecosystem for generated types
-and the runtime. Do not introduce prost, protobuf-rs, or another protobuf
-runtime unless a change explicitly requires it.
+Workspace members are under `crates/`. `csm-proxy` is the
+`crosspoint-simulator-mcp-proxy` binary. `csm-pb-bindings` builds and
+exposes the buffa bindings for this repository's IDL.
+
+Use [clap](https://docs.rs/clap) with clap's derive API (`Parser`,
+`Args`, `Subcommand`, and related derives) for Rust CLI patterns. Do not
+parse `std::env::args` by hand when clap can express the interface.
+
+## Protobuf and buffa
+
+Protobuf is our IDL. Use the [buffa](https://github.com/anthropics/buffa)
+ecosystem for generated types and the runtime. Do not introduce prost,
+protobuf-rs, or another protobuf runtime unless a change explicitly
+requires it.
 
 The first RPC listener binding is gRPC. The eBook firmware simulator talks
 gRPC to this process.
@@ -43,25 +56,44 @@ ConnectRPC is not excluded, and it is not implemented yet. Using buffa and
 Buf does not exclude ConnectRPC or other transports and serialization the
 IDL can emit.
 
-Generate Rust from `.proto` files with Buf, not `buffa-build` or a
-system `protoc`. Resolve the `buf` binary through the
-[`buf-tools`](https://crates.io/crates/buf-tools) crate
-(`buf_tools::buf_bin_path()`), then run `buf generate`. Do not assume `buf`
-is installed on `PATH`. The first `buf-tools` build downloads and verifies
-official Buf release binaries.
+For proto layout, lint (including `COMMENTS`), and breaking policy, read
+[`protos/AGENTS.md`](protos/AGENTS.md).
 
-Follow buffa's recommended [`buf generate` pattern](https://github.com/anthropics/buffa#using-buf-generate-recommended):
+## Generating protobuf bindings
 
-- `buf.gen.yaml` version `v2` with the remote plugin
-  `buf.build/anthropics/buffa` (no local `protoc-gen-buffa` install)
-- `out: src/gen`
+Generate Rust with Buf, not `buffa-build` or a system `protoc`. Resolve
+the `buf` binary through the [`buf-tools`](https://crates.io/crates/buf-tools)
+crate (`buf_tools::buf_bin_path()`), then run `buf generate`. Do not
+assume `buf` is installed on `PATH`. The first `buf-tools` build
+downloads and verifies official Buf release binaries.
+
+Follow buffa's recommended
+[`buf generate` pattern](https://github.com/anthropics/buffa#using-buf-generate-recommended):
+
+- `buf.gen.yaml` version `v2` in `crates/csm-pb-bindings` with the remote
+  plugin `buf.build/anthropics/buffa` (no local `protoc-gen-buffa` install)
+- `out: src/gen` in that crate
 - plugin opts `file_per_package=true` and `json=true`
 - one `<dotted.package>.rs` file per proto package
 - a hand-written `src/gen/mod.rs` that `include!`s those files into a
-  `pub mod` tree
+  `pub mod` tree, exposed as `csm_pb_bindings::generated` (`gen` is a
+  reserved keyword in edition 2024)
 
-When pinning the remote plugin, match it to the `buffa` crate version in
-`Cargo.toml`.
+`csm-pb-bindings`'s `build.rs` runs `buf generate` via `buf-tools`. When
+pinning the remote plugin, match it to the `buffa` crate version in the
+workspace `Cargo.toml`.
+
+Workspace-level generate rules (where to run Buf, what not to vendor)
+are in [`protos/AGENTS.md`](protos/AGENTS.md).
+
+## Commits
+
+Prefer [Conventional Commits](https://www.conventionalcommits.org/):
+`type(optional-scope): description`.
+
+Use `feat`, `fix`, `docs`, `chore`, `refactor`, `test`, `build`, or
+`ci`. `csm-proxy` and `csm-pb-bindings` are fine scopes. Keep the
+subject imperative and focused on why the change exists.
 
 ## Agent Documentation Standards
 
