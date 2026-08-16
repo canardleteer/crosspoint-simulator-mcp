@@ -13,8 +13,19 @@ name = "crosspoint-simulator-mcp-proxy"
 path = "src/main.rs"
 
 [dependencies]
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
+buffa-types.workspace = true
 clap.workspace = true
 connectrpc.workspace = true
 csm-pb-bindings.workspace = true
 futures = "0.3"
+rmcp.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+rmcp = { workspace = true, features = [
+    "client",
+    "transport-streamable-http-client-reqwest",
+] }

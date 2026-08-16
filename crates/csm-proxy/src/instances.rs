@@ -12,6 +12,14 @@ use tokio::sync::mpsc;
 /// Capacity of each per-instance inbound and outbound queue.
 pub const QUEUE_CAPACITY: usize = 32;
 
+/// Maximum length of a [`Register::instance_id`] and of any later selector.
+pub const INSTANCE_ID_MAX_LEN: usize = 64;
+
+/// True when `id` is a usable instance id: 1–64 bytes, not empty.
+pub fn is_valid_instance_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= INSTANCE_ID_MAX_LEN
+}
+
 /// Why [`InstanceMap::try_send`] failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrySendError {
@@ -19,6 +27,15 @@ pub enum TrySendError {
     UnknownInstance,
     /// Outbound queue is full; a stuck peer must not block the caller.
     QueueFull,
+}
+
+/// Why [`InstanceMap::resolve`] could not pick an instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolveError {
+    /// The selector was empty, omitted, or longer than [`INSTANCE_ID_MAX_LEN`].
+    EmptyId,
+    /// The named (or default) instance is not connected.
+    UnknownInstance,
 }
 
 /// Snapshot of a connected instance for listing and tests.
@@ -72,6 +89,8 @@ struct Instance {
 pub struct InstanceMap {
     inner: Arc<Mutex<HashMap<String, Instance>>>,
     next_token: Arc<AtomicU64>,
+    next_corr: Arc<AtomicU64>,
+    default_instance: Arc<Mutex<Option<String>>>,
 }
 
 impl Default for InstanceMap {
@@ -86,6 +105,8 @@ impl InstanceMap {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
             next_token: Arc::new(AtomicU64::new(1)),
+            next_corr: Arc::new(AtomicU64::new(1)),
+            default_instance: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -104,6 +125,10 @@ impl InstanceMap {
         let sink = InboundSink {
             queue: inbound.clone(),
         };
+        debug_assert!(
+            is_valid_instance_id(&register.instance_id),
+            "instance_id must be 1-64 bytes"
+        );
         let id = register.instance_id.clone();
         let inst = Instance {
             token,
@@ -154,6 +179,68 @@ impl InstanceMap {
             .keys()
             .cloned()
             .collect()
+    }
+
+    /// Snapshots of every connected instance, in arbitrary order.
+    pub fn snapshots(&self) -> Vec<InstanceSnapshot> {
+        self.inner
+            .lock()
+            .expect("instance map lock")
+            .values()
+            .map(|inst| InstanceSnapshot {
+                token: inst.token,
+                register: inst.register.clone(),
+                last_heartbeat: inst.last_heartbeat.clone(),
+            })
+            .collect()
+    }
+
+    /// Next `ServerToSim.corr` for an MCP enqueue.
+    pub fn next_corr(&self) -> u64 {
+        self.next_corr.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Optional process default used only by [`Self::resolve_or_default`].
+    ///
+    /// Empty or over-long values are stored as unset. This is never inferred
+    /// from how many simulators are connected.
+    pub fn set_default_instance(&self, id: Option<String>) {
+        *self.default_instance.lock().expect("default instance lock") =
+            id.filter(|s| is_valid_instance_id(s));
+    }
+
+    /// Current default instance id, if any.
+    pub fn default_instance(&self) -> Option<String> {
+        self.default_instance
+            .lock()
+            .expect("default instance lock")
+            .clone()
+    }
+
+    /// Snapshot of the instance named by `id`.
+    ///
+    /// `id` must be a valid instance id. This never picks "the only connected
+    /// simulator" and never substitutes the process default.
+    pub fn resolve(&self, id: &str) -> Result<InstanceSnapshot, ResolveError> {
+        if !is_valid_instance_id(id) {
+            return Err(ResolveError::EmptyId);
+        }
+        self.get(id).ok_or(ResolveError::UnknownInstance)
+    }
+
+    /// Resolve `id`, or the process default when `id` is omitted.
+    ///
+    /// An empty or over-long `id` is an error, not a wildcard. A missing `id`
+    /// uses [`Self::default_instance`] when that is a valid id. Connection
+    /// count is not consulted.
+    pub fn resolve_or_default(&self, id: Option<&str>) -> Result<InstanceSnapshot, ResolveError> {
+        match id {
+            Some(id) => self.resolve(id),
+            None => match self.default_instance() {
+                Some(default) => self.resolve(&default),
+                None => Err(ResolveError::EmptyId),
+            },
+        }
     }
 
     /// Snapshot of one instance, if connected.
@@ -306,5 +393,106 @@ mod tests {
         let (_token, _sink) = map.insert(register("q"), 2, tx);
         map.try_send("q", outbound(1)).unwrap();
         assert_eq!(map.try_send("q", outbound(2)), Err(TrySendError::QueueFull));
+    }
+
+    fn insert_id(map: &InstanceMap, id: &str) {
+        let (tx, _rx) = mpsc::channel(1);
+        map.insert(register(id), 4, tx);
+    }
+
+    #[test]
+    fn instance_id_rejects_empty_and_overlong() {
+        assert!(!is_valid_instance_id(""));
+        assert!(!is_valid_instance_id(&"x".repeat(INSTANCE_ID_MAX_LEN + 1)));
+        assert!(is_valid_instance_id("a"));
+        assert!(is_valid_instance_id(&"x".repeat(INSTANCE_ID_MAX_LEN)));
+    }
+
+    #[test]
+    fn resolve_requires_a_real_id() {
+        let map = InstanceMap::new();
+        insert_id(&map, "only");
+        assert_eq!(map.resolve("").unwrap_err(), ResolveError::EmptyId);
+        assert_eq!(
+            map.resolve(&"x".repeat(INSTANCE_ID_MAX_LEN + 1))
+                .unwrap_err(),
+            ResolveError::EmptyId
+        );
+        assert_eq!(
+            map.resolve_or_default(None).unwrap_err(),
+            ResolveError::EmptyId
+        );
+        assert_eq!(
+            map.resolve_or_default(Some("")).unwrap_err(),
+            ResolveError::EmptyId
+        );
+        assert_eq!(map.resolve("only").unwrap().register.instance_id, "only");
+    }
+
+    #[test]
+    fn resolve_does_not_infer_the_only_connected_instance() {
+        let map = InstanceMap::new();
+        insert_id(&map, "only");
+        assert_eq!(
+            map.resolve_or_default(None).unwrap_err(),
+            ResolveError::EmptyId
+        );
+        insert_id(&map, "other");
+        assert_eq!(
+            map.resolve_or_default(None).unwrap_err(),
+            ResolveError::EmptyId
+        );
+    }
+
+    #[test]
+    fn resolve_named_id() {
+        let map = InstanceMap::new();
+        insert_id(&map, "a");
+        insert_id(&map, "b");
+        assert_eq!(map.resolve("b").unwrap().register.instance_id, "b");
+        assert_eq!(
+            map.resolve("nope").unwrap_err(),
+            ResolveError::UnknownInstance
+        );
+    }
+
+    #[test]
+    fn resolve_or_default_uses_configured_id_only() {
+        let map = InstanceMap::new();
+        map.set_default_instance(Some("hint".into()));
+        assert_eq!(map.default_instance().as_deref(), Some("hint"));
+        assert_eq!(
+            map.resolve_or_default(None).unwrap_err(),
+            ResolveError::UnknownInstance
+        );
+
+        insert_id(&map, "a");
+        insert_id(&map, "hint");
+        assert_eq!(
+            map.resolve_or_default(None).unwrap().register.instance_id,
+            "hint"
+        );
+        assert_eq!(
+            map.resolve_or_default(Some("a"))
+                .unwrap()
+                .register
+                .instance_id,
+            "a"
+        );
+        assert_eq!(map.resolve("a").unwrap().register.instance_id, "a");
+    }
+
+    #[test]
+    fn resolve_ignores_empty_or_overlong_default() {
+        let map = InstanceMap::new();
+        map.set_default_instance(Some(String::new()));
+        assert!(map.default_instance().is_none());
+        map.set_default_instance(Some("x".repeat(INSTANCE_ID_MAX_LEN + 1)));
+        assert!(map.default_instance().is_none());
+        insert_id(&map, "only");
+        assert_eq!(
+            map.resolve_or_default(None).unwrap_err(),
+            ResolveError::EmptyId
+        );
     }
 }

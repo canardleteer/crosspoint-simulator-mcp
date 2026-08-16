@@ -19,6 +19,7 @@ enum InputSource {
 // Identity and device profile sent once when the stream opens.
 message Register {
   // Unique id for this simulator process (caller-chosen or generated).
+  // Required: 1–64 bytes. Empty is invalid.
   string instance_id = 1;
   // Board profile: x4, x3, x4_pro, or sticky.
   string board_id = 2;

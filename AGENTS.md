@@ -12,7 +12,22 @@ An MCP server that lets a host application control and observe an eBook
 firmware simulator (with UI), and observe a person using that simulator.
 The simulator is not an MCP peer. The first integration path is an
 already-running simulator that dials in; spawning a known simulator
-remains allowed and is not the first path.
+remains allowed and is not implemented yet.
+
+Instance ids are required and cannot be empty: `Register.instance_id`
+and every later selector must be 1–64 bytes. Do not omit an id when
+exactly one simulator is connected, and do not infer a target from
+connection count. MCP tools that target a session name an id, or use
+the process default from `--default-instance` / `CSM_DEFAULT_INSTANCE`
+when that flag is a valid id. Inbound `Session` is how a simulator
+appears today. `--simulator` and `--simulator-arg` are reserved spawn
+hints and must not start a process.
+
+This process is the MCP peer (`rmcp`). Default MCP transport is stdio
+(JSON-RPC only on stdout; logs go to stderr). `--mcp-http` /
+`CSM_MCP_HTTP` selects Streamable HTTP instead, mounted at `/mcp`.
+The gRPC `Session` listener stays up either way. The simulator is not
+an MCP peer.
 
 ## Simulator submodule
 

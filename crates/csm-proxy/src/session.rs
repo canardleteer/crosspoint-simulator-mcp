@@ -12,7 +12,7 @@ use csm_pb_bindings::rpc::crosspoint::sim::control::v1alpha1::SimulatorControlSe
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
-use crate::instances::{InstanceMap, QUEUE_CAPACITY};
+use crate::instances::{InstanceMap, QUEUE_CAPACITY, is_valid_instance_id};
 
 /// connectrpc service that registers streams on [`InstanceMap`].
 #[derive(Clone)]
@@ -55,7 +55,7 @@ impl SimulatorControlService for SessionService {
         };
         let register = *register;
         let instance_id = register.instance_id.clone();
-        if instance_id.is_empty() || instance_id.len() > 64 {
+        if !is_valid_instance_id(&instance_id) {
             return Err(ConnectError::invalid_argument(
                 "instance_id must be 1-64 bytes",
             ));
