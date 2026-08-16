@@ -2,7 +2,9 @@
 
 use std::time::Duration;
 
-use csm_pb_bindings::generated::crosspoint::sim::control::v1alpha1::Register;
+use csm_pb_bindings::generated::crosspoint::sim::control::v1alpha1::{
+    InputAck, Register, SimToServer, SnapshotFrame,
+};
 use csm_proxy::{InstanceMap, McpServer, serve_mcp_http_listener};
 use rmcp::ServiceExt;
 use rmcp::model::{
@@ -74,6 +76,71 @@ async fn stdio_lists_tools_and_instances() {
     assert_ne!(listed.is_error, Some(true));
     let body = tool_json(&listed);
     assert_eq!(body["instances"][0]["instanceId"], "sim-a");
+    client.cancel().await.expect("cancel client");
+}
+
+#[tokio::test]
+async fn stdio_inject_and_snapshot_wait_for_session_replies() {
+    let instances = InstanceMap::new();
+    let (tx, mut rx) = mpsc::channel(4);
+    instances.insert(register("sim-a"), 4, tx);
+    let map = instances.clone();
+    tokio::spawn(async move {
+        let inject = rx.recv().await.expect("inject");
+        map.push_inbound(
+            "sim-a",
+            SimToServer {
+                corr: inject.corr,
+                payload: Some(
+                    InputAck {
+                        accepted: true,
+                        ..Default::default()
+                    }
+                    .into(),
+                ),
+                ..Default::default()
+            },
+        );
+        let snap = rx.recv().await.expect("snapshot");
+        map.push_inbound(
+            "sim-a",
+            SimToServer {
+                corr: snap.corr,
+                payload: Some(
+                    SnapshotFrame {
+                        pixels: vec![0x01],
+                        mime_type: "image/png".into(),
+                        width: 1,
+                        height: 1,
+                        ..Default::default()
+                    }
+                    .into(),
+                ),
+                ..Default::default()
+            },
+        );
+    });
+    let client = connect_duplex(instances).await;
+    let injected = client
+        .call_tool(
+            CallToolRequestParams::new("inject_touch").with_arguments(args(
+                json!({ "instance_id": "sim-a", "kind": 3, "x": 1, "y": 2 }),
+            )),
+        )
+        .await
+        .expect("inject_touch");
+    assert_ne!(injected.is_error, Some(true));
+    assert_eq!(tool_json(&injected)["accepted"], true);
+
+    let snap = client
+        .call_tool(
+            CallToolRequestParams::new("request_snapshot")
+                .with_arguments(args(json!({ "instance_id": "sim-a" }))),
+        )
+        .await
+        .expect("request_snapshot");
+    assert_ne!(snap.is_error, Some(true));
+    assert!(snap.content.iter().any(|block| block.as_image().is_some()));
     client.cancel().await.expect("cancel client");
 }
 
@@ -161,21 +228,22 @@ async fn streamable_http_catalog_enqueues_and_reads_resources() {
     for (name, value) in [
         (
             "inject_touch",
-            json!({ "instance_id": "sim-http", "kind": 3, "x": 1, "y": 2 }),
+            json!({ "instance_id": "sim-http", "kind": 3, "x": 1, "y": 2, "wait": false }),
         ),
         (
             "inject_key",
-            json!({ "instance_id": "sim-http", "name": "ENTER", "hold_ms": 10 }),
+            json!({ "instance_id": "sim-http", "name": "ENTER", "hold_ms": 10, "wait": false }),
         ),
         (
             "inject_home",
-            json!({ "instance_id": "sim-http", "hold_ms": 10 }),
+            json!({ "instance_id": "sim-http", "hold_ms": 10, "wait": false }),
         ),
         (
             "inject_swipe",
             json!({
                 "instance_id": "sim-http",
-                "start_x": 1, "start_y": 2, "end_x": 3, "end_y": 4, "duration_ms": 20
+                "start_x": 1, "start_y": 2, "end_x": 3, "end_y": 4, "duration_ms": 20,
+                "wait": false
             }),
         ),
         (
@@ -184,7 +252,7 @@ async fn streamable_http_catalog_enqueues_and_reads_resources() {
         ),
         (
             "request_snapshot",
-            json!({ "instance_id": "sim-http", "region": false }),
+            json!({ "instance_id": "sim-http", "region": false, "wait": false }),
         ),
         (
             "set_session_view",

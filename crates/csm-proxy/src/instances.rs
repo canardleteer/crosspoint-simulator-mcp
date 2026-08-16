@@ -3,14 +3,18 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use csm_pb_bindings::generated::crosspoint::sim::control::v1alpha1::{
     Heartbeat, Register, ServerToSim, SimToServer,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 /// Capacity of each per-instance inbound and outbound queue.
 pub const QUEUE_CAPACITY: usize = 32;
+
+/// How long MCP waits for a corr-matched `InputAck` or snapshot reply.
+pub const REPLY_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Maximum length of a [`Register::instance_id`] and of any later selector.
 pub const INSTANCE_ID_MAX_LEN: usize = 64;
@@ -27,6 +31,19 @@ pub enum TrySendError {
     UnknownInstance,
     /// Outbound queue is full; a stuck peer must not block the caller.
     QueueFull,
+}
+
+/// Why [`InstanceMap::send_and_wait`] failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitError {
+    /// No connected instance with that id.
+    UnknownInstance,
+    /// Outbound queue is full; a stuck peer must not block the caller.
+    QueueFull,
+    /// No corr-matched reply arrived before [`REPLY_TIMEOUT`].
+    Timeout,
+    /// The instance disconnected while waiting.
+    Disconnected,
 }
 
 /// Why [`InstanceMap::resolve`] could not pick an instance.
@@ -91,6 +108,8 @@ pub struct InstanceMap {
     next_token: Arc<AtomicU64>,
     next_corr: Arc<AtomicU64>,
     default_instance: Arc<Mutex<Option<String>>>,
+    waiters: Arc<Mutex<HashMap<u64, oneshot::Sender<SimToServer>>>>,
+    waiter_instance: Arc<Mutex<HashMap<u64, String>>>,
 }
 
 impl Default for InstanceMap {
@@ -107,6 +126,8 @@ impl InstanceMap {
             next_token: Arc::new(AtomicU64::new(1)),
             next_corr: Arc::new(AtomicU64::new(1)),
             default_instance: Arc::new(Mutex::new(None)),
+            waiters: Arc::new(Mutex::new(HashMap::new())),
+            waiter_instance: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -168,6 +189,8 @@ impl InstanceMap {
         let mut map = self.inner.lock().expect("instance map lock");
         if map.get(instance_id).is_some_and(|inst| inst.token == token) {
             map.remove(instance_id);
+            drop(map);
+            self.fail_waiters(instance_id);
         }
     }
 
@@ -272,6 +295,93 @@ impl InstanceMap {
             .expect("instance map lock")
             .get(instance_id)
             .and_then(|inst| inst.inbound.try_recv())
+    }
+
+    /// Complete a corr waiter (if any) and enqueue the inbound envelope.
+    pub fn push_inbound(&self, instance_id: &str, msg: SimToServer) {
+        self.complete_waiter(&msg);
+        if let Some(inst) = self
+            .inner
+            .lock()
+            .expect("instance map lock")
+            .get(instance_id)
+        {
+            inst.inbound.push(msg);
+        }
+    }
+
+    /// Enqueue `msg` and wait for a corr-matched inbound reply.
+    pub async fn send_and_wait(
+        &self,
+        instance_id: &str,
+        msg: ServerToSim,
+        timeout: Duration,
+    ) -> Result<SimToServer, WaitError> {
+        if self.get(instance_id).is_none() {
+            return Err(WaitError::UnknownInstance);
+        }
+        let corr = msg.corr;
+        let rx = self.register_waiter(instance_id, corr);
+        match self.try_send(instance_id, msg) {
+            Ok(()) => {}
+            Err(TrySendError::UnknownInstance) => {
+                self.take_waiter(corr);
+                return Err(WaitError::UnknownInstance);
+            }
+            Err(TrySendError::QueueFull) => {
+                self.take_waiter(corr);
+                return Err(WaitError::QueueFull);
+            }
+        }
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(reply)) => Ok(reply),
+            Ok(Err(_)) => Err(WaitError::Disconnected),
+            Err(_) => {
+                self.take_waiter(corr);
+                Err(WaitError::Timeout)
+            }
+        }
+    }
+
+    fn register_waiter(&self, instance_id: &str, corr: u64) -> oneshot::Receiver<SimToServer> {
+        let (tx, rx) = oneshot::channel();
+        self.waiters.lock().expect("waiters lock").insert(corr, tx);
+        self.waiter_instance
+            .lock()
+            .expect("waiter instance lock")
+            .insert(corr, instance_id.to_string());
+        rx
+    }
+
+    fn take_waiter(&self, corr: u64) -> Option<oneshot::Sender<SimToServer>> {
+        self.waiter_instance
+            .lock()
+            .expect("waiter instance lock")
+            .remove(&corr);
+        self.waiters.lock().expect("waiters lock").remove(&corr)
+    }
+
+    fn complete_waiter(&self, msg: &SimToServer) {
+        if msg.corr == 0 {
+            return;
+        }
+        if let Some(tx) = self.take_waiter(msg.corr) {
+            let _ = tx.send(msg.clone());
+        }
+    }
+
+    fn fail_waiters(&self, instance_id: &str) {
+        let corrs: Vec<u64> = self
+            .waiter_instance
+            .lock()
+            .expect("waiter instance lock")
+            .iter()
+            .filter(|(_, id)| id.as_str() == instance_id)
+            .map(|(corr, _)| *corr)
+            .collect();
+        for corr in corrs {
+            self.take_waiter(corr);
+        }
     }
 }
 
@@ -493,6 +603,77 @@ mod tests {
         assert_eq!(
             map.resolve_or_default(None).unwrap_err(),
             ResolveError::EmptyId
+        );
+    }
+
+    #[tokio::test]
+    async fn send_and_wait_completes_on_matching_corr() {
+        let map = InstanceMap::new();
+        let (tx, _rx) = mpsc::channel(4);
+        map.insert(register("a"), 4, tx);
+        let corr = map.next_corr();
+        let wait = map.send_and_wait("a", outbound(corr), REPLY_TIMEOUT);
+        tokio::pin!(wait);
+        assert!(matches!(
+            futures::poll!(&mut wait),
+            std::task::Poll::Pending
+        ));
+        map.push_inbound(
+            "a",
+            SimToServer {
+                corr,
+                ..Default::default()
+            },
+        );
+        let reply = wait.await.unwrap();
+        assert_eq!(reply.corr, corr);
+        assert_eq!(map.try_recv_inbound("a").unwrap().corr, corr);
+    }
+
+    #[tokio::test]
+    async fn send_and_wait_times_out() {
+        let map = InstanceMap::new();
+        let (tx, _rx) = mpsc::channel(4);
+        map.insert(register("a"), 4, tx);
+        let err = map
+            .send_and_wait("a", outbound(7), Duration::from_millis(20))
+            .await
+            .unwrap_err();
+        assert_eq!(err, WaitError::Timeout);
+    }
+
+    #[tokio::test]
+    async fn send_and_wait_fails_when_instance_drops() {
+        let map = InstanceMap::new();
+        let (tx, _rx) = mpsc::channel(4);
+        let (token, _sink) = map.insert(register("a"), 4, tx);
+        let wait = map.send_and_wait("a", outbound(3), REPLY_TIMEOUT);
+        tokio::pin!(wait);
+        assert!(matches!(
+            futures::poll!(&mut wait),
+            std::task::Poll::Pending
+        ));
+        map.remove_if("a", token);
+        assert_eq!(wait.await.unwrap_err(), WaitError::Disconnected);
+    }
+
+    #[tokio::test]
+    async fn send_and_wait_unknown_and_queue_full() {
+        let map = InstanceMap::new();
+        assert_eq!(
+            map.send_and_wait("missing", outbound(1), REPLY_TIMEOUT)
+                .await
+                .unwrap_err(),
+            WaitError::UnknownInstance
+        );
+        let (tx, _rx) = mpsc::channel(1);
+        map.insert(register("a"), 4, tx);
+        map.try_send("a", outbound(1)).unwrap();
+        assert_eq!(
+            map.send_and_wait("a", outbound(2), REPLY_TIMEOUT)
+                .await
+                .unwrap_err(),
+            WaitError::QueueFull
         );
     }
 }

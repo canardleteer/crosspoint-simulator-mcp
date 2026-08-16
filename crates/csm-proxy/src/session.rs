@@ -62,7 +62,7 @@ impl SimulatorControlService for SessionService {
         }
 
         let (outbound_tx, outbound_rx) = mpsc::channel(QUEUE_CAPACITY);
-        let (token, inbound) = self.instances.insert(register, QUEUE_CAPACITY, outbound_tx);
+        let (token, _inbound) = self.instances.insert(register, QUEUE_CAPACITY, outbound_tx);
         let instances = self.instances.clone();
         let id_for_loop = instance_id.clone();
 
@@ -78,14 +78,14 @@ impl SimulatorControlService for SessionService {
                 match &owned.payload {
                     Some(sim_to_server::Payload::Heartbeat(heartbeat)) => {
                         instances.set_heartbeat(&id_for_loop, token, heartbeat.as_ref().clone());
-                        inbound.push(owned);
+                        instances.push_inbound(&id_for_loop, owned);
                     }
                     Some(sim_to_server::Payload::Goodbye(_)) => {
-                        inbound.push(owned);
+                        instances.push_inbound(&id_for_loop, owned);
                         instances.remove_if(&id_for_loop, token);
                         break;
                     }
-                    _ => inbound.push(owned),
+                    _ => instances.push_inbound(&id_for_loop, owned),
                 }
             }
             instances.remove_if(&id_for_loop, token);

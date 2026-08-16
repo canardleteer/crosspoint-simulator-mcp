@@ -3,10 +3,12 @@
 use std::sync::Arc;
 
 use axum::Router;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use buffa_types::google::protobuf::FieldMask;
 use csm_pb_bindings::generated::crosspoint::sim::control::v1alpha1::{
     InjectHome, InjectKey, InjectSwipe, InjectTouch, ServerToSim, SetInjectEnabled, SetSessionView,
-    ShutdownRequest, SnapshotRequest,
+    ShutdownRequest, SnapshotRequest, sim_to_server,
 };
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -26,7 +28,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
-use crate::instances::{InstanceMap, InstanceSnapshot, ResolveError, TrySendError};
+use crate::instances::{
+    InstanceMap, InstanceSnapshot, REPLY_TIMEOUT, ResolveError, TrySendError, WaitError,
+};
 
 const INSTANCES_URI: &str = "csm://instances";
 const INSTANCE_URI_PREFIX: &str = "csm://instances/";
@@ -62,6 +66,7 @@ impl McpServer {
     fn enqueue(
         &self,
         instance_id: Option<&str>,
+        ack_requested: bool,
         payload: impl Into<
             csm_pb_bindings::generated::crosspoint::sim::control::v1alpha1::server_to_sim::Payload,
         >,
@@ -71,7 +76,7 @@ impl McpServer {
         let corr = self.instances.next_corr();
         let msg = ServerToSim {
             corr,
-            ack_requested: false,
+            ack_requested,
             payload: Some(payload.into()),
             ..Default::default()
         };
@@ -84,6 +89,76 @@ impl McpServer {
             "instanceId": id,
             "corr": corr,
         }))
+    }
+
+    async fn enqueue_wait(
+        &self,
+        instance_id: Option<&str>,
+        ack_requested: bool,
+        payload: impl Into<
+            csm_pb_bindings::generated::crosspoint::sim::control::v1alpha1::server_to_sim::Payload,
+        >,
+    ) -> Result<
+        (
+            String,
+            u64,
+            csm_pb_bindings::generated::crosspoint::sim::control::v1alpha1::SimToServer,
+        ),
+        String,
+    > {
+        let snap = self.resolve(instance_id)?;
+        let id = snap.register.instance_id.clone();
+        let corr = self.instances.next_corr();
+        let msg = ServerToSim {
+            corr,
+            ack_requested,
+            payload: Some(payload.into()),
+            ..Default::default()
+        };
+        let reply = self
+            .instances
+            .send_and_wait(&id, msg, REPLY_TIMEOUT)
+            .await
+            .map_err(|err| match err {
+                WaitError::UnknownInstance => "unknown instance".to_string(),
+                WaitError::QueueFull => "outbound queue is full".to_string(),
+                WaitError::Timeout => "timed out waiting for session reply".to_string(),
+                WaitError::Disconnected => "instance disconnected".to_string(),
+            })?;
+        Ok((id, corr, reply))
+    }
+
+    async fn inject(
+        &self,
+        instance_id: Option<&str>,
+        wait: bool,
+        payload: impl Into<
+            csm_pb_bindings::generated::crosspoint::sim::control::v1alpha1::server_to_sim::Payload,
+        >,
+    ) -> Result<Value, String> {
+        if !wait {
+            return self.enqueue(instance_id, false, payload);
+        }
+        let (id, corr, reply) = self.enqueue_wait(instance_id, true, payload).await?;
+        match reply.payload {
+            Some(sim_to_server::Payload::InputAck(ack)) => {
+                if ack.accepted {
+                    Ok(json!({
+                        "accepted": true,
+                        "instanceId": id,
+                        "corr": corr,
+                    }))
+                } else {
+                    let reason = if ack.reason.is_empty() {
+                        "inject rejected".to_string()
+                    } else {
+                        ack.reason.clone()
+                    };
+                    Err(reason)
+                }
+            }
+            _ => Err("unexpected session reply".into()),
+        }
     }
 
     fn snapshot_json(snap: &InstanceSnapshot) -> Value {
@@ -130,16 +205,18 @@ impl McpServer {
         }))
     }
 
-    /// Enqueue a touch inject.
-    pub fn inject_touch_json(
+    /// Inject a touch edge. When `wait` is true, wait for `InputAck`.
+    pub async fn inject_touch_json(
         &self,
         instance_id: Option<&str>,
         kind: u32,
         x: u32,
         y: u32,
+        wait: bool,
     ) -> Result<Value, String> {
-        self.enqueue(
+        self.inject(
             instance_id,
+            wait,
             InjectTouch {
                 kind,
                 x,
@@ -147,42 +224,49 @@ impl McpServer {
                 ..Default::default()
             },
         )
+        .await
     }
 
-    /// Enqueue a key inject.
-    pub fn inject_key_json(
+    /// Inject a named key. When `wait` is true, wait for `InputAck`.
+    pub async fn inject_key_json(
         &self,
         instance_id: Option<&str>,
         name: String,
         hold_ms: u32,
+        wait: bool,
     ) -> Result<Value, String> {
-        self.enqueue(
+        self.inject(
             instance_id,
+            wait,
             InjectKey {
                 name,
                 hold_ms,
                 ..Default::default()
             },
         )
+        .await
     }
 
-    /// Enqueue a Home inject.
-    pub fn inject_home_json(
+    /// Inject Home. When `wait` is true, wait for `InputAck`.
+    pub async fn inject_home_json(
         &self,
         instance_id: Option<&str>,
         hold_ms: u32,
+        wait: bool,
     ) -> Result<Value, String> {
-        self.enqueue(
+        self.inject(
             instance_id,
+            wait,
             InjectHome {
                 hold_ms,
                 ..Default::default()
             },
         )
+        .await
     }
 
-    /// Enqueue a swipe inject.
-    pub fn inject_swipe_json(
+    /// Inject a swipe. When `wait` is true, wait for `InputAck`.
+    pub async fn inject_swipe_json(
         &self,
         instance_id: Option<&str>,
         start_x: u32,
@@ -190,9 +274,11 @@ impl McpServer {
         end_x: u32,
         end_y: u32,
         duration_ms: u32,
+        wait: bool,
     ) -> Result<Value, String> {
-        self.enqueue(
+        self.inject(
             instance_id,
+            wait,
             InjectSwipe {
                 start_x,
                 start_y,
@@ -202,6 +288,7 @@ impl McpServer {
                 ..Default::default()
             },
         )
+        .await
     }
 
     /// Enqueue inject-enabled.
@@ -212,6 +299,7 @@ impl McpServer {
     ) -> Result<Value, String> {
         self.enqueue(
             instance_id,
+            false,
             SetInjectEnabled {
                 enabled,
                 ..Default::default()
@@ -219,8 +307,8 @@ impl McpServer {
         )
     }
 
-    /// Enqueue a snapshot request; does not wait for a frame.
-    pub fn request_snapshot_json(
+    /// Request a snapshot. When `wait` is true, wait for a frame or error.
+    pub async fn request_snapshot_result(
         &self,
         instance_id: Option<&str>,
         region: bool,
@@ -229,19 +317,53 @@ impl McpServer {
         width: u32,
         height: u32,
         format: u32,
-    ) -> Result<Value, String> {
-        self.enqueue(
-            instance_id,
-            SnapshotRequest {
-                region,
-                x,
-                y,
-                width,
-                height,
-                format,
-                ..Default::default()
+        wait: bool,
+    ) -> Result<CallToolResult, McpError> {
+        let payload = SnapshotRequest {
+            region,
+            x,
+            y,
+            width,
+            height,
+            format,
+            ..Default::default()
+        };
+        if !wait {
+            return Self::tool_result(self.enqueue(instance_id, false, payload));
+        }
+        match self.enqueue_wait(instance_id, false, payload).await {
+            Ok((id, corr, reply)) => match reply.payload {
+                Some(sim_to_server::Payload::Snapshot(frame)) => {
+                    let mime = if frame.mime_type.is_empty() {
+                        "image/png".to_string()
+                    } else {
+                        frame.mime_type.clone()
+                    };
+                    let text = json!({
+                        "instanceId": id,
+                        "corr": corr,
+                        "mimeType": mime,
+                        "width": frame.width,
+                        "height": frame.height,
+                        "generation": frame.generation,
+                    });
+                    Ok(CallToolResult::success(vec![
+                        ContentBlock::text(text.to_string()),
+                        ContentBlock::image(BASE64.encode(&frame.pixels), mime),
+                    ]))
+                }
+                Some(sim_to_server::Payload::SnapshotError(err)) => {
+                    let message = if err.message.is_empty() {
+                        "snapshot failed".to_string()
+                    } else {
+                        err.message.clone()
+                    };
+                    Self::tool_result(Err(message))
+                }
+                _ => Self::tool_result(Err("unexpected session reply".into())),
             },
-        )
+            Err(message) => Self::tool_result(Err(message)),
+        }
     }
 
     /// Enqueue a session view mask.
@@ -252,6 +374,7 @@ impl McpServer {
     ) -> Result<Value, String> {
         self.enqueue(
             instance_id,
+            false,
             SetSessionView {
                 read_mask: FieldMask {
                     paths,
@@ -265,7 +388,7 @@ impl McpServer {
 
     /// Enqueue a shutdown request.
     pub fn shutdown_instance_json(&self, instance_id: Option<&str>) -> Result<Value, String> {
-        self.enqueue(instance_id, ShutdownRequest::default())
+        self.enqueue(instance_id, false, ShutdownRequest::default())
     }
 
     fn tool_result(result: Result<Value, String>) -> Result<CallToolResult, McpError> {
@@ -297,6 +420,10 @@ impl McpServer {
     }
 }
 
+fn default_wait() -> bool {
+    true
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct InstanceParams {
     /// Instance id (1–64 bytes). Required unless `--default-instance` is set.
@@ -315,6 +442,9 @@ struct InjectTouchParams {
     x: u32,
     /// Touch y in panel pixels.
     y: u32,
+    /// When true (default), wait for InputAck.
+    #[serde(default = "default_wait")]
+    wait: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -327,6 +457,9 @@ struct InjectKeyParams {
     /// Hold duration in milliseconds; 0 means the default 80.
     #[serde(default)]
     hold_ms: u32,
+    /// When true (default), wait for InputAck.
+    #[serde(default = "default_wait")]
+    wait: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -337,6 +470,9 @@ struct InjectHomeParams {
     /// Hold duration in milliseconds.
     #[serde(default)]
     hold_ms: u32,
+    /// When true (default), wait for InputAck.
+    #[serde(default = "default_wait")]
+    wait: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -355,6 +491,9 @@ struct InjectSwipeParams {
     /// Duration of the swipe in milliseconds.
     #[serde(default)]
     duration_ms: u32,
+    /// When true (default), wait for InputAck.
+    #[serde(default = "default_wait")]
+    wait: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -389,6 +528,9 @@ struct SnapshotParams {
     /// Encoded format; 0 is PNG with a device-appropriate palette.
     #[serde(default)]
     format: u32,
+    /// When true (default), wait for SnapshotFrame or SnapshotError.
+    #[serde(default = "default_wait")]
+    wait: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -417,51 +559,66 @@ impl McpServer {
     }
 
     #[tool(description = "Inject a touch edge or tap on the named instance")]
-    fn inject_touch(
+    async fn inject_touch(
         &self,
         Parameters(params): Parameters<InjectTouchParams>,
     ) -> Result<CallToolResult, McpError> {
-        Self::tool_result(self.inject_touch_json(
-            params.instance_id.as_deref(),
-            params.kind,
-            params.x,
-            params.y,
-        ))
+        Self::tool_result(
+            self.inject_touch_json(
+                params.instance_id.as_deref(),
+                params.kind,
+                params.x,
+                params.y,
+                params.wait,
+            )
+            .await,
+        )
     }
 
     #[tool(description = "Inject a named device key on the named instance")]
-    fn inject_key(
+    async fn inject_key(
         &self,
         Parameters(params): Parameters<InjectKeyParams>,
     ) -> Result<CallToolResult, McpError> {
-        Self::tool_result(self.inject_key_json(
-            params.instance_id.as_deref(),
-            params.name,
-            params.hold_ms,
-        ))
+        Self::tool_result(
+            self.inject_key_json(
+                params.instance_id.as_deref(),
+                params.name,
+                params.hold_ms,
+                params.wait,
+            )
+            .await,
+        )
     }
 
     #[tool(description = "Inject the Home key on the named instance")]
-    fn inject_home(
+    async fn inject_home(
         &self,
         Parameters(params): Parameters<InjectHomeParams>,
     ) -> Result<CallToolResult, McpError> {
-        Self::tool_result(self.inject_home_json(params.instance_id.as_deref(), params.hold_ms))
+        Self::tool_result(
+            self.inject_home_json(params.instance_id.as_deref(), params.hold_ms, params.wait)
+                .await,
+        )
     }
 
     #[tool(description = "Inject a swipe on the named instance")]
-    fn inject_swipe(
+    async fn inject_swipe(
         &self,
         Parameters(params): Parameters<InjectSwipeParams>,
     ) -> Result<CallToolResult, McpError> {
-        Self::tool_result(self.inject_swipe_json(
-            params.instance_id.as_deref(),
-            params.start_x,
-            params.start_y,
-            params.end_x,
-            params.end_y,
-            params.duration_ms,
-        ))
+        Self::tool_result(
+            self.inject_swipe_json(
+                params.instance_id.as_deref(),
+                params.start_x,
+                params.start_y,
+                params.end_x,
+                params.end_y,
+                params.duration_ms,
+                params.wait,
+            )
+            .await,
+        )
     }
 
     #[tool(description = "Enable or disable remote inject on the named instance")]
@@ -474,12 +631,12 @@ impl McpServer {
         )
     }
 
-    #[tool(description = "Queue a panel snapshot request; does not wait for the frame")]
-    fn request_snapshot(
+    #[tool(description = "Request a panel snapshot; waits for PNG bytes unless wait is false")]
+    async fn request_snapshot(
         &self,
         Parameters(params): Parameters<SnapshotParams>,
     ) -> Result<CallToolResult, McpError> {
-        Self::tool_result(self.request_snapshot_json(
+        self.request_snapshot_result(
             params.instance_id.as_deref(),
             params.region,
             params.x,
@@ -487,7 +644,9 @@ impl McpServer {
             params.width,
             params.height,
             params.format,
-        ))
+            params.wait,
+        )
+        .await
     }
 
     #[tool(description = "Set which SimToServer payloads the session should emit")]
@@ -626,8 +785,11 @@ pub async fn serve_mcp_http_listener(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
     use csm_pb_bindings::generated::crosspoint::sim::control::v1alpha1::{
-        InputObserved, InputSource, KeyEdge, Register, SimToServer, server_to_sim,
+        InputAck, InputObserved, InputSource, KeyEdge, Register, SimToServer, SnapshotError,
+        SnapshotFrame, server_to_sim,
     };
     use tokio::sync::mpsc;
 
@@ -666,12 +828,15 @@ mod tests {
         assert!(mcp.get_instance_json(Some("missing")).is_err());
     }
 
-    #[test]
-    fn inject_is_readable_on_the_session_queue() {
+    #[tokio::test]
+    async fn inject_is_readable_on_the_session_queue() {
         let map = InstanceMap::new();
         let (mut rx, _sink) = insert(&map, "sim-a");
         let mcp = McpServer::new(map);
-        let queued = mcp.inject_touch_json(Some("sim-a"), 3, 10, 20).unwrap();
+        let queued = mcp
+            .inject_touch_json(Some("sim-a"), 3, 10, 20, false)
+            .await
+            .unwrap();
         assert_eq!(queued["queued"], true);
         let msg = rx.try_recv().unwrap();
         assert!(!msg.ack_requested);
@@ -686,8 +851,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn enqueue_reports_unknown_and_queue_full() {
+    #[tokio::test]
+    async fn enqueue_reports_unknown_and_queue_full() {
         let map = InstanceMap::new();
         let (tx, _rx) = mpsc::channel(1);
         map.insert(register("sim-a"), 4, tx);
@@ -695,10 +860,28 @@ mod tests {
         assert!(mcp.shutdown_instance_json(Some("nope")).is_err());
         mcp.shutdown_instance_json(Some("sim-a")).unwrap();
         assert_eq!(
-            mcp.inject_key_json(Some("sim-a"), "ENTER".into(), 0)
+            mcp.inject_key_json(Some("sim-a"), "ENTER".into(), 0, false)
+                .await
                 .unwrap_err(),
             "outbound queue is full"
         );
+        assert_eq!(
+            mcp.inject_key_json(Some("sim-a"), "ENTER".into(), 0, true)
+                .await
+                .unwrap_err(),
+            "outbound queue is full"
+        );
+        assert_eq!(
+            mcp.inject_touch_json(Some("nope"), 3, 0, 0, true)
+                .await
+                .unwrap_err(),
+            "unknown instance"
+        );
+        let missing = mcp
+            .request_snapshot_result(Some("nope"), false, 0, 0, 0, 0, 0, true)
+            .await
+            .unwrap();
+        assert_eq!(missing.is_error, Some(true));
     }
 
     #[test]
@@ -762,17 +945,23 @@ mod tests {
         );
     }
 
-    #[test]
-    fn remaining_enqueues_and_snapshot_do_not_wait() {
+    #[tokio::test]
+    async fn remaining_enqueues_and_snapshot_do_not_wait() {
         let map = InstanceMap::new();
         let (mut rx, _sink) = insert(&map, "sim-a");
         let mcp = McpServer::new(map);
-        mcp.inject_home_json(Some("sim-a"), 40).unwrap();
-        mcp.inject_swipe_json(Some("sim-a"), 1, 2, 3, 4, 50)
+        mcp.inject_home_json(Some("sim-a"), 40, false)
+            .await
+            .unwrap();
+        mcp.inject_swipe_json(Some("sim-a"), 1, 2, 3, 4, 50, false)
+            .await
             .unwrap();
         mcp.set_inject_enabled_json(Some("sim-a"), false).unwrap();
-        mcp.request_snapshot_json(Some("sim-a"), true, 0, 0, 8, 8, 0)
+        let snap = mcp
+            .request_snapshot_result(Some("sim-a"), true, 0, 0, 8, 8, 0, false)
+            .await
             .unwrap();
+        assert_ne!(snap.is_error, Some(true));
         mcp.set_session_view_json(Some("sim-a"), vec!["log".into(), "input_observed".into()])
             .unwrap();
         let kinds: Vec<_> = (0..5)
@@ -786,5 +975,271 @@ mod tests {
             })
             .collect();
         assert_eq!(kinds, ["home", "swipe", "inject", "snap", "view"]);
+    }
+
+    #[tokio::test]
+    async fn inject_wait_completes_on_input_ack() {
+        let map = InstanceMap::new();
+        let (mut rx, _sink) = insert(&map, "sim-a");
+        let mcp = McpServer::new(map.clone());
+        let waiter =
+            tokio::spawn(
+                async move { mcp.inject_touch_json(Some("sim-a"), 3, 10, 20, true).await },
+            );
+        let msg = rx.recv().await.unwrap();
+        assert!(msg.ack_requested);
+        map.push_inbound(
+            "sim-a",
+            SimToServer {
+                corr: msg.corr,
+                payload: Some(
+                    InputAck {
+                        accepted: true,
+                        ..Default::default()
+                    }
+                    .into(),
+                ),
+                ..Default::default()
+            },
+        );
+        let result = waiter.await.unwrap().unwrap();
+        assert_eq!(result["accepted"], true);
+        assert_eq!(result["corr"], msg.corr);
+    }
+
+    #[tokio::test]
+    async fn inject_wait_rejects_with_reason() {
+        let map = InstanceMap::new();
+        let (mut rx, _sink) = insert(&map, "sim-a");
+        let mcp = McpServer::new(map.clone());
+        let waiter = tokio::spawn(async move {
+            mcp.inject_key_json(Some("sim-a"), "ENTER".into(), 0, true)
+                .await
+        });
+        let msg = rx.recv().await.unwrap();
+        map.push_inbound(
+            "sim-a",
+            SimToServer {
+                corr: msg.corr,
+                payload: Some(
+                    InputAck {
+                        accepted: false,
+                        reason: "inject_disabled".into(),
+                        ..Default::default()
+                    }
+                    .into(),
+                ),
+                ..Default::default()
+            },
+        );
+        assert_eq!(waiter.await.unwrap().unwrap_err(), "inject_disabled");
+    }
+
+    #[tokio::test]
+    async fn inject_wait_rejects_without_reason() {
+        let map = InstanceMap::new();
+        let (mut rx, _sink) = insert(&map, "sim-a");
+        let mcp = McpServer::new(map.clone());
+        let waiter =
+            tokio::spawn(async move { mcp.inject_home_json(Some("sim-a"), 0, true).await });
+        let msg = rx.recv().await.unwrap();
+        map.push_inbound(
+            "sim-a",
+            SimToServer {
+                corr: msg.corr,
+                payload: Some(
+                    InputAck {
+                        accepted: false,
+                        ..Default::default()
+                    }
+                    .into(),
+                ),
+                ..Default::default()
+            },
+        );
+        assert_eq!(waiter.await.unwrap().unwrap_err(), "inject rejected");
+    }
+
+    #[tokio::test]
+    async fn inject_wait_rejects_unexpected_reply() {
+        let map = InstanceMap::new();
+        let (mut rx, _sink) = insert(&map, "sim-a");
+        let mcp = McpServer::new(map.clone());
+        let waiter = tokio::spawn(async move {
+            mcp.inject_swipe_json(Some("sim-a"), 1, 2, 3, 4, 10, true)
+                .await
+        });
+        let msg = rx.recv().await.unwrap();
+        map.push_inbound(
+            "sim-a",
+            SimToServer {
+                corr: msg.corr,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            waiter.await.unwrap().unwrap_err(),
+            "unexpected session reply"
+        );
+    }
+
+    #[tokio::test]
+    async fn inject_wait_maps_disconnect() {
+        let map = InstanceMap::new();
+        let (tx, _rx) = mpsc::channel(4);
+        let (token, _sink) = map.insert(register("sim-a"), 4, tx);
+        let mcp = McpServer::new(map.clone());
+        let waiter =
+            tokio::spawn(async move { mcp.inject_home_json(Some("sim-a"), 0, true).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        map.remove_if("sim-a", token);
+        assert_eq!(waiter.await.unwrap().unwrap_err(), "instance disconnected");
+    }
+
+    #[tokio::test]
+    async fn snapshot_wait_returns_image_content() {
+        let map = InstanceMap::new();
+        let (mut rx, _sink) = insert(&map, "sim-a");
+        let mcp = McpServer::new(map.clone());
+        let waiter = tokio::spawn(async move {
+            mcp.request_snapshot_result(Some("sim-a"), false, 0, 0, 0, 0, 0, true)
+                .await
+        });
+        let msg = rx.recv().await.unwrap();
+        assert!(!msg.ack_requested);
+        map.push_inbound(
+            "sim-a",
+            SimToServer {
+                corr: msg.corr,
+                payload: Some(
+                    SnapshotFrame {
+                        pixels: vec![0x89, 0x50],
+                        width: 2,
+                        height: 3,
+                        generation: 9,
+                        ..Default::default()
+                    }
+                    .into(),
+                ),
+                ..Default::default()
+            },
+        );
+        let result = waiter.await.unwrap().unwrap();
+        assert_ne!(result.is_error, Some(true));
+        let image = result
+            .content
+            .iter()
+            .find_map(ContentBlock::as_image)
+            .expect("image block");
+        assert_eq!(image.mime_type, "image/png");
+        assert_eq!(image.data, BASE64.encode([0x89, 0x50]));
+        let text = result
+            .content
+            .iter()
+            .find_map(ContentBlock::as_text)
+            .expect("text block");
+        let body: Value = serde_json::from_str(&text.text).unwrap();
+        assert_eq!(body["width"], 2);
+        assert_eq!(body["height"], 3);
+        assert_eq!(body["generation"], 9);
+    }
+
+    #[tokio::test]
+    async fn snapshot_wait_returns_error_message() {
+        let map = InstanceMap::new();
+        let (mut rx, _sink) = insert(&map, "sim-a");
+        let mcp = McpServer::new(map.clone());
+        let waiter = tokio::spawn(async move {
+            mcp.request_snapshot_result(Some("sim-a"), false, 0, 0, 0, 0, 0, true)
+                .await
+        });
+        let msg = rx.recv().await.unwrap();
+        map.push_inbound(
+            "sim-a",
+            SimToServer {
+                corr: msg.corr,
+                payload: Some(
+                    SnapshotError {
+                        message: "panel busy".into(),
+                        ..Default::default()
+                    }
+                    .into(),
+                ),
+                ..Default::default()
+            },
+        );
+        let result = waiter.await.unwrap().unwrap();
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(
+            result
+                .content
+                .iter()
+                .find_map(ContentBlock::as_text)
+                .map(|text| text.text.as_str()),
+            Some("panel busy")
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_wait_defaults_empty_error_and_rejects_unexpected() {
+        let map = InstanceMap::new();
+        let (mut rx, _sink) = insert(&map, "sim-a");
+        let mcp = McpServer::new(map.clone());
+        let waiter = tokio::spawn({
+            let mcp = mcp.clone();
+            async move {
+                mcp.request_snapshot_result(Some("sim-a"), false, 0, 0, 0, 0, 0, true)
+                    .await
+            }
+        });
+        let msg = rx.recv().await.unwrap();
+        map.push_inbound(
+            "sim-a",
+            SimToServer {
+                corr: msg.corr,
+                payload: Some(SnapshotError::default().into()),
+                ..Default::default()
+            },
+        );
+        let result = waiter.await.unwrap().unwrap();
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(
+            result
+                .content
+                .iter()
+                .find_map(ContentBlock::as_text)
+                .map(|text| text.text.as_str()),
+            Some("snapshot failed")
+        );
+
+        let waiter = tokio::spawn(async move {
+            mcp.request_snapshot_result(Some("sim-a"), false, 0, 0, 0, 0, 0, true)
+                .await
+        });
+        let msg = rx.recv().await.unwrap();
+        map.push_inbound(
+            "sim-a",
+            SimToServer {
+                corr: msg.corr,
+                payload: Some(
+                    InputAck {
+                        accepted: true,
+                        ..Default::default()
+                    }
+                    .into(),
+                ),
+                ..Default::default()
+            },
+        );
+        let result = waiter.await.unwrap().unwrap();
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(
+            result
+                .content
+                .iter()
+                .find_map(ContentBlock::as_text)
+                .map(|text| text.text.as_str()),
+            Some("unexpected session reply")
+        );
     }
 }

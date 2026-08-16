@@ -6,10 +6,11 @@ use std::time::Duration;
 use connectrpc::client::{ClientConfig, HttpClient};
 use connectrpc::{Protocol, Server};
 use csm_pb_bindings::generated::crosspoint::sim::control::v1alpha1::{
-    Goodbye, Heartbeat, LogLine, Register, ServerToSim, ShutdownRequest, SimToServer,
+    Goodbye, Heartbeat, InputAck, LogLine, Register, ServerToSim, ShutdownRequest, SimToServer,
+    SnapshotError, SnapshotFrame, server_to_sim,
 };
 use csm_pb_bindings::rpc::crosspoint::sim::control::v1alpha1::SimulatorControlServiceClient;
-use csm_proxy::{InstanceMap, QUEUE_CAPACITY, SessionService, TrySendError};
+use csm_proxy::{InstanceMap, McpServer, QUEUE_CAPACITY, SessionService, TrySendError};
 
 fn register_msg(instance_id: &str) -> SimToServer {
     SimToServer {
@@ -340,4 +341,209 @@ async fn serve_accepts_a_register() {
     wait_until(|| instances.get("via-serve").is_some()).await;
     session.close_send();
     server.abort();
+}
+
+#[tokio::test]
+async fn fake_client_acks_an_inject() {
+    let (addr, instances) = start_listener().await;
+    let client = grpc_client(addr);
+    let mut session = client.session().await.expect("open Session");
+    session
+        .send(register_msg("sim-ack"))
+        .await
+        .expect("send Register");
+    wait_until(|| instances.get("sim-ack").is_some()).await;
+
+    let mcp = McpServer::new(instances);
+    let waiter =
+        tokio::spawn(async move { mcp.inject_touch_json(Some("sim-ack"), 3, 8, 9, true).await });
+    let outbound = session
+        .message()
+        .await
+        .expect("recv inject")
+        .expect("inject present")
+        .to_owned_message();
+    assert!(outbound.ack_requested);
+    match outbound.payload {
+        Some(server_to_sim::Payload::InjectTouch(touch)) => {
+            assert_eq!(touch.x, 8);
+            assert_eq!(touch.y, 9);
+        }
+        other => panic!("unexpected payload: {other:?}"),
+    }
+    session
+        .send(SimToServer {
+            corr: outbound.corr,
+            payload: Some(
+                InputAck {
+                    accepted: true,
+                    ..Default::default()
+                }
+                .into(),
+            ),
+            ..Default::default()
+        })
+        .await
+        .expect("send InputAck");
+    let result = waiter.await.unwrap().unwrap();
+    assert_eq!(result["accepted"], true);
+    session.close_send();
+}
+
+#[tokio::test]
+async fn fake_client_rejects_an_inject() {
+    let (addr, instances) = start_listener().await;
+    let client = grpc_client(addr);
+    let mut session = client.session().await.expect("open Session");
+    session
+        .send(register_msg("sim-nack"))
+        .await
+        .expect("send Register");
+    wait_until(|| instances.get("sim-nack").is_some()).await;
+
+    let mcp = McpServer::new(instances);
+    let waiter = tokio::spawn(async move {
+        mcp.inject_key_json(Some("sim-nack"), "ENTER".into(), 0, true)
+            .await
+    });
+    let outbound = session
+        .message()
+        .await
+        .expect("recv inject")
+        .expect("inject present")
+        .to_owned_message();
+    session
+        .send(SimToServer {
+            corr: outbound.corr,
+            payload: Some(
+                InputAck {
+                    accepted: false,
+                    reason: "queue_full".into(),
+                    ..Default::default()
+                }
+                .into(),
+            ),
+            ..Default::default()
+        })
+        .await
+        .expect("send InputAck");
+    assert_eq!(waiter.await.unwrap().unwrap_err(), "queue_full");
+    session.close_send();
+}
+
+#[tokio::test]
+async fn fake_client_replies_with_a_snapshot_frame() {
+    let (addr, instances) = start_listener().await;
+    let client = grpc_client(addr);
+    let mut session = client.session().await.expect("open Session");
+    session
+        .send(register_msg("sim-snap"))
+        .await
+        .expect("send Register");
+    wait_until(|| instances.get("sim-snap").is_some()).await;
+
+    let mcp = McpServer::new(instances);
+    let waiter = tokio::spawn(async move {
+        mcp.request_snapshot_result(Some("sim-snap"), false, 0, 0, 0, 0, 0, true)
+            .await
+    });
+    let outbound = session
+        .message()
+        .await
+        .expect("recv snapshot request")
+        .expect("snapshot request present")
+        .to_owned_message();
+    assert!(!outbound.ack_requested);
+    assert!(matches!(
+        outbound.payload,
+        Some(server_to_sim::Payload::SnapshotRequest(_))
+    ));
+    session
+        .send(SimToServer {
+            corr: outbound.corr,
+            payload: Some(
+                SnapshotFrame {
+                    pixels: vec![0x89, 0x50, 0x4e, 0x47],
+                    mime_type: "image/png".into(),
+                    width: 4,
+                    height: 2,
+                    generation: 11,
+                    ..Default::default()
+                }
+                .into(),
+            ),
+            ..Default::default()
+        })
+        .await
+        .expect("send SnapshotFrame");
+    let result = waiter.await.unwrap().unwrap();
+    assert_ne!(result.is_error, Some(true));
+    assert!(
+        result
+            .content
+            .iter()
+            .any(|block| block.as_image().is_some())
+    );
+    session.close_send();
+}
+
+#[tokio::test]
+async fn fake_client_replies_with_a_snapshot_error() {
+    let (addr, instances) = start_listener().await;
+    let client = grpc_client(addr);
+    let mut session = client.session().await.expect("open Session");
+    session
+        .send(register_msg("sim-snap-err"))
+        .await
+        .expect("send Register");
+    wait_until(|| instances.get("sim-snap-err").is_some()).await;
+
+    let mcp = McpServer::new(instances);
+    let waiter = tokio::spawn(async move {
+        mcp.request_snapshot_result(Some("sim-snap-err"), false, 0, 0, 0, 0, 0, true)
+            .await
+    });
+    let outbound = session
+        .message()
+        .await
+        .expect("recv snapshot request")
+        .expect("snapshot request present")
+        .to_owned_message();
+    session
+        .send(SimToServer {
+            corr: outbound.corr,
+            payload: Some(
+                SnapshotError {
+                    message: "no panel".into(),
+                    ..Default::default()
+                }
+                .into(),
+            ),
+            ..Default::default()
+        })
+        .await
+        .expect("send SnapshotError");
+    let result = waiter.await.unwrap().unwrap();
+    assert_eq!(result.is_error, Some(true));
+    session.close_send();
+}
+
+#[tokio::test]
+async fn inject_wait_times_out_when_the_client_stays_silent() {
+    let (addr, instances) = start_listener().await;
+    let client = grpc_client(addr);
+    let mut session = client.session().await.expect("open Session");
+    session
+        .send(register_msg("sim-silent"))
+        .await
+        .expect("send Register");
+    wait_until(|| instances.get("sim-silent").is_some()).await;
+
+    let mcp = McpServer::new(instances);
+    let err = mcp
+        .inject_home_json(Some("sim-silent"), 0, true)
+        .await
+        .unwrap_err();
+    assert_eq!(err, "timed out waiting for session reply");
+    session.close_send();
 }

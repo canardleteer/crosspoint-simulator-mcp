@@ -11,8 +11,8 @@ use connectrpc::Server;
 
 pub use cli::Args;
 pub use instances::{
-    INSTANCE_ID_MAX_LEN, InstanceMap, InstanceSnapshot, QUEUE_CAPACITY, ResolveError, TrySendError,
-    is_valid_instance_id,
+    INSTANCE_ID_MAX_LEN, InstanceMap, InstanceSnapshot, QUEUE_CAPACITY, REPLY_TIMEOUT,
+    ResolveError, TrySendError, WaitError, is_valid_instance_id,
 };
 pub use mcp::{McpServer, serve_mcp_http, serve_mcp_http_listener, serve_mcp_stdio};
 pub use session::SessionService;
