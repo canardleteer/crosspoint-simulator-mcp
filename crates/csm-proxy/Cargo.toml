@@ -4,10 +4,17 @@ version.workspace = true
 edition.workspace = true
 autobins = false
 
+[lib]
+name = "csm_proxy"
+path = "src/lib.rs"
+
 [[bin]]
 name = "crosspoint-simulator-mcp-proxy"
 path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
+connectrpc.workspace = true
 csm-pb-bindings.workspace = true
+futures = "0.3"
+tokio.workspace = true

@@ -2,8 +2,13 @@ version: v2
 inputs:
   - directory: ../../protos
 plugins:
-  - remote: buf.build/anthropics/buffa:v0.9.1
+  - remote: buf.build/anthropics/buffa:v0.8.1
     out: src/gen
     opt:
       - file_per_package=true
       - json=true
+  - remote: buf.build/connectrpc/rust:v0.8.0
+    out: src/gen_connect
+    opt:
+      - file_per_package
+      - buffa_module=crate::generated

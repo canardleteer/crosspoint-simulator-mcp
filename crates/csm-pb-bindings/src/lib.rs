@@ -1,4 +1,7 @@
-//! Generated buffa bindings for this repository's protobuf IDL.
+//! Generated buffa message types and connectrpc Session stubs.
 
 #[path = "gen/mod.rs"]
 pub mod generated;
+
+#[path = "gen_connect/mod.rs"]
+pub mod rpc;

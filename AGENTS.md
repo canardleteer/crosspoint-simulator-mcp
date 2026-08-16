@@ -36,7 +36,8 @@ The submodule tracks
 
 Workspace members are under `crates/`. `csm-proxy` is the
 `crosspoint-simulator-mcp-proxy` binary. `csm-pb-bindings` builds and
-exposes the buffa bindings for this repository's IDL.
+exposes the buffa message types and connectrpc `Session` stubs for this
+repository's IDL.
 
 Use [clap](https://docs.rs/clap) with clap's derive API (`Parser`,
 `Args`, `Subcommand`, and related derives) for Rust CLI patterns. Do not
@@ -56,46 +57,69 @@ confirm MCP facts from
 or [modelcontextprotocol.io](https://modelcontextprotocol.io). Do not
 treat memory of the protocol as sufficient for normative claims.
 
-## Protobuf and buffa
+## Protobuf, buffa, and RPC
 
 Protobuf is our IDL. Use the [buffa](https://github.com/anthropics/buffa)
-ecosystem for generated types and the runtime. Do not introduce prost,
-protobuf-rs, or another protobuf runtime unless a change explicitly
-requires it.
+ecosystem for generated message types and the runtime. Buffa encodes and
+decodes protobuf; it is not an RPC server and does not emit service
+stubs. Do not introduce prost, protobuf-rs, or another protobuf runtime
+unless a change explicitly requires it.
 
-The first RPC listener binding is gRPC. The eBook firmware simulator talks
+The first `Session` binding is gRPC. The eBook firmware simulator talks
 gRPC to this process.
 
-ConnectRPC is not excluded, and it is not implemented yet. Using buffa and
-Buf does not exclude ConnectRPC or other transports and serialization the
-IDL can emit.
+The RPC server stack is [connectrpc](https://crates.io/crates/connectrpc)
+(connect-rust). One handler can speak gRPC, Connect, and gRPC-Web.
+Simulator clients use **gRPC**. Connect is available because the stack
+speaks it, not because a client must. Do not introduce tonic unless
+connectrpc cannot host this bidirectional stream.
+
+Which transports actually carry `Session`:
+
+- **gRPC** — the first binding; this is what a simulator client dials
+- **Connect** — same handler; not required and not the simulator hop
+- **gRPC-Web / browsers** — not a `Session` path. Bidirectional streams
+  are poorly supported; a browser would need an adapter, not this stream
+  as-is
+
+Do not introduce prost as our protobuf runtime. connectrpc may pull
+other HTTP crates; that does not change the IDL runtime.
 
 For proto layout, lint (including `COMMENTS`), and breaking policy, read
 [`protos/AGENTS.md`](protos/AGENTS.md).
 
 ## Generating protobuf bindings
 
-Generate Rust with Buf, not `buffa-build` or a system `protoc`. Resolve
-the `buf` binary through the [`buf-tools`](https://crates.io/crates/buf-tools)
-crate (`buf_tools::buf_bin_path()`), then run `buf generate`. Do not
-assume `buf` is installed on `PATH`. The first `buf-tools` build
-downloads and verifies official Buf release binaries.
+Generate Rust with Buf, not `buffa-build`, `connectrpc-build`, or a
+system `protoc`. Resolve the `buf` binary through the
+[`buf-tools`](https://crates.io/crates/buf-tools) crate
+(`buf_tools::buf_bin_path()`), then run `buf generate`. Do not assume
+`buf` is installed on `PATH`. The first `buf-tools` build downloads and
+verifies official Buf release binaries.
 
 Follow buffa's recommended
-[`buf generate` pattern](https://github.com/anthropics/buffa#using-buf-generate-recommended):
+[`buf generate` pattern](https://github.com/anthropics/buffa#using-buf-generate-recommended)
+for **messages**, and a second remote plugin for **service stubs**:
 
-- `buf.gen.yaml` version `v2` in `crates/csm-pb-bindings` with the remote
-  plugin `buf.build/anthropics/buffa` (no local `protoc-gen-buffa` install)
-- `out: src/gen` in that crate
+- `buf.gen.yaml` version `v2` in `crates/csm-pb-bindings`
+- `buf.build/anthropics/buffa` → `out: src/gen` (no local
+  `protoc-gen-buffa` install)
 - plugin opts `file_per_package=true` and `json=true`
 - one `<dotted.package>.rs` file per proto package
 - a hand-written `src/gen/mod.rs` that `include!`s those files into a
   `pub mod` tree, exposed as `csm_pb_bindings::generated` (`gen` is a
   reserved keyword in edition 2024)
+- `buf.build/connectrpc/rust` → `out: src/gen_connect` (separate `out`
+  so filenames do not collide)
+- plugin opts `file_per_package` and `buffa_module=crate::generated`
+- a hand-written `src/gen_connect/mod.rs`, exposed as
+  `csm_pb_bindings::rpc`
 
 `csm-pb-bindings`'s `build.rs` runs `buf generate` via `buf-tools`. When
-pinning the remote plugin, match it to the `buffa` crate version in the
-workspace `Cargo.toml`.
+pinning a remote plugin, match it to the corresponding crate minor in
+the workspace `Cargo.toml` (`buffa` for the buffa plugin, `connectrpc`
+for the connect-rust plugin). connectrpc 0.8 depends on buffa 0.8.x, so
+this workspace stays on that buffa minor until connectrpc adopts 0.9.
 
 Workspace-level generate rules (where to run Buf, what not to vendor)
 are in [`protos/AGENTS.md`](protos/AGENTS.md).

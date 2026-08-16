@@ -1,2 +1,4 @@
 /src/gen/*.rs
 !/src/gen/mod.rs
+/src/gen_connect/*.rs
+!/src/gen_connect/mod.rs

@@ -1,5 +1,13 @@
 # crosspoint-simulator-mcp
 
+`crosspoint-simulator-mcp-proxy` listens for inbound simulator `Session`
+streams over gRPC (plaintext). Default listen address is
+`127.0.0.1:50051`. Override with `--listen` or `CSM_LISTEN`.
+
+```bash
+cargo run -p csm-proxy -- --listen 127.0.0.1:50051
+```
+
 ## Cloning this repository
 
 This repository includes the `crosspoint-simulator` git submodule. Clone with
