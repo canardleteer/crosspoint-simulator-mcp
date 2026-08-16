@@ -13,6 +13,7 @@ Environment
 Modes
   (default)       Two instances, then missing-simulator and missing-server
   --human         Prompt for real key/click in the SDL window, then observe HUMAN
+  --headless      One instance with --sim-headless; heartbeat, inject, snapshot
   --show-windows  Open real SDL windows during automated mode
   --keep          Leave proxy/simulator processes running on exit
 """
@@ -220,22 +221,21 @@ class Harness:
         self.mcp = Mcp(self.mcp_url)
         return proc
 
-    def start_sim(self, instance_id: str) -> Proc:
+    def start_sim(self, instance_id: str, *, headless: bool = False) -> Proc:
         extra_env: dict[str, str] = {}
         if not self.args.show_windows and not self.args.human:
             extra_env["SDL_VIDEODRIVER"] = "dummy"
-        return self.spawn(
+        argv = [
+            str(self.sim_bin),
+            "--sim-grpc",
+            "--sim-grpc-addr",
+            self.listen,
+            "--sim-instance-id",
             instance_id,
-            [
-                str(self.sim_bin),
-                "--sim-grpc",
-                "--sim-grpc-addr",
-                self.listen,
-                "--sim-instance-id",
-                instance_id,
-            ],
-            extra_env=extra_env or None,
-        )
+        ]
+        if headless:
+            argv.append("--sim-headless")
+        return self.spawn(instance_id, argv, extra_env=extra_env or None)
 
     def reconnect_mcp(self) -> Mcp:
         self.mcp = Mcp(self.mcp_url)
@@ -399,6 +399,52 @@ def run_automated(harness: Harness) -> None:
     print("ok simulator redials after the server returns")
 
 
+def run_headless(harness: Harness) -> None:
+    harness.start_proxy()
+    sim = harness.start_sim("e2e-headless", headless=True)
+    harness.wait_instances({"e2e-headless"})
+    deadline = time.time() + 5.0
+    heartbeat: dict[str, Any] = {}
+    while time.time() < deadline:
+        inst = tool_json(harness.call("get_instance", {"instance_id": "e2e-headless"}))
+        heartbeat = inst.get("lastHeartbeat") or {}
+        if heartbeat.get("headless") is True:
+            break
+        time.sleep(0.2)
+    else:
+        raise Fail(f"lastHeartbeat.headless was not true: {heartbeat}")
+    require(sim.alive(), "headless simulator exited before heartbeat")
+    print("ok heartbeat reports headless")
+
+    harness.drain_observe("e2e-headless")
+    injected = harness.call(
+        "inject_key",
+        {"instance_id": "e2e-headless", "name": "ENTER", "hold_ms": 80},
+    )
+    require(not tool_error(injected), f"inject_key failed: {tool_text(injected)}")
+    body = tool_json(injected)
+    require(body.get("accepted") is True, f"inject_key not accepted: {body}")
+    events = harness.wait_remote_key("e2e-headless", "ENTER")
+    require(
+        "INPUT_SOURCE_HUMAN" not in [
+            (event.get("inputObserved") or {}).get("source")
+            for event in events
+            if event.get("inputObserved")
+        ],
+        f"headless observe saw HUMAN: {events}",
+    )
+    print("ok inject ENTER is remote and not human")
+
+    snap = harness.call("request_snapshot", {"instance_id": "e2e-headless"})
+    require(not tool_error(snap), f"snapshot failed: {tool_text(snap)}")
+    snap_body = tool_json(snap)
+    require(snap_body.get("instanceId") == "e2e-headless", f"snapshot id: {snap_body}")
+    require(snap_body.get("mimeType") == "image/png", f"snapshot mime: {snap_body}")
+    require(int(snap_body.get("width") or 0) > 0, f"snapshot width: {snap_body}")
+    require(int(snap_body.get("height") or 0) > 0, f"snapshot height: {snap_body}")
+    print("ok snapshot PNG")
+
+
 def run_human(harness: Harness) -> None:
     harness.start_proxy()
     sim = harness.start_sim("e2e-human")
@@ -438,6 +484,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="prompt for a real key/click, then require INPUT_SOURCE_HUMAN",
     )
     parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="one instance with --sim-headless; require heartbeat, inject, snapshot",
+    )
+    parser.add_argument(
         "--keep",
         action="store_true",
         help="leave proxy and simulator processes running",
@@ -462,8 +513,12 @@ def main(argv: list[str]) -> int:
         print(f"FAIL: {err}", file=sys.stderr)
         return 2
     try:
+        if args.human and args.headless:
+            raise Fail("--human and --headless cannot be combined")
         if args.human:
             run_human(harness)
+        elif args.headless:
+            run_headless(harness)
         else:
             run_automated(harness)
         print("PASS")
