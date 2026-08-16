@@ -172,11 +172,14 @@ A second Buf template, [`protos/buf.gen.sim-cpp.yaml`](protos/buf.gen.sim-cpp.ya
 emits C++ protobuf and grpc++ stubs into the `crosspoint-simulator`
 submodule at `src/sim_grpc/gen`. That generate file lives in this
 repository for now and will move later. Run
-`cargo xtask generate-sim-cpp`. It uses the host `protoc` built-in C++
-plugin and `grpc_cpp_plugin` on `PATH` so the stubs match the
-protobuf/grpc++ libraries the simulator links. The simulator commits
-those outputs and does not need the `.proto` files to build. Do not run
-this generate from `csm-pb-bindings`'s `build.rs`.
+`cargo xtask generate-sim-cpp`. It uses remote Buf plugins
+`buf.build/protocolbuffers/cpp:v35.1` and `buf.build/grpc/cpp:v1.83.0`
+(see [buf.build/plugins/cpp](https://buf.build/plugins/cpp)). The
+simulator links a locally built protobuf / grpc++ prefix of those
+versions via `pkg-config`; Ubuntu apt 3.21 / 1.51 is too old for these
+stubs. The simulator commits the outputs and does not need the `.proto`
+files to build. Do not run this generate from `csm-pb-bindings`'s
+`build.rs`.
 
 Workspace-level generate rules (where to run Buf, what not to vendor)
 are in [`protos/AGENTS.md`](protos/AGENTS.md).

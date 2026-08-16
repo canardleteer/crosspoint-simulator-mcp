@@ -144,22 +144,6 @@ fn run_generate_sim_cpp() -> Result<(), String> {
     let out = root.join("crosspoint-simulator/src/sim_grpc/gen");
     fs::create_dir_all(&out).map_err(|e| e.to_string())?;
 
-    if Command::new("sh")
-        .args(["-c", "command -v grpc_cpp_plugin"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| !s.success())
-        .unwrap_or(true)
-    {
-        return Err(
-            "grpc_cpp_plugin not found on PATH. Install protobuf-compiler-grpc \
-             (and libgrpc++-dev / libprotobuf-dev) or add a local gRPC prefix \
-             to PATH, then re-run cargo xtask generate-sim-cpp."
-                .into(),
-        );
-    }
-
     let buf = buf_tools::buf_bin_path();
     let status = Command::new(&buf)
         .arg("generate")
