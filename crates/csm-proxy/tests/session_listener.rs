@@ -6,8 +6,8 @@ use std::time::Duration;
 use connectrpc::client::{ClientConfig, HttpClient};
 use connectrpc::{Protocol, Server};
 use csm_pb_bindings::generated::crosspoint::sim::control::v1alpha1::{
-    Goodbye, Heartbeat, InputAck, LogLine, Register, ServerToSim, ShutdownRequest, SimToServer,
-    SnapshotError, SnapshotFrame, server_to_sim,
+    Goodbye, Heartbeat, InputAck, InputObserved, InputSource, KeyEdge, LogLine, Register,
+    ServerToSim, ShutdownRequest, SimToServer, SnapshotError, SnapshotFrame, server_to_sim,
 };
 use csm_pb_bindings::rpc::crosspoint::sim::control::v1alpha1::SimulatorControlServiceClient;
 use csm_proxy::{InstanceMap, McpServer, QUEUE_CAPACITY, SessionService, TrySendError};
@@ -545,5 +545,156 @@ async fn inject_wait_times_out_when_the_client_stays_silent() {
         .await
         .unwrap_err();
     assert_eq!(err, "timed out waiting for session reply");
+    session.close_send();
+}
+
+fn input_observed_msg(seq: u64, source: InputSource, name: &str) -> SimToServer {
+    SimToServer {
+        seq,
+        payload: Some(
+            InputObserved {
+                source: source.into(),
+                event: Some(
+                    KeyEdge {
+                        name: name.into(),
+                        down: true,
+                        ..Default::default()
+                    }
+                    .into(),
+                ),
+                ..Default::default()
+            }
+            .into(),
+        ),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn observe_honors_session_view_and_keeps_heartbeat() {
+    let (addr, instances) = start_listener().await;
+    let client = grpc_client(addr);
+    let mut session = client.session().await.expect("open Session");
+    session
+        .send(register_msg("sim-view"))
+        .await
+        .expect("send Register");
+    wait_until(|| instances.get("sim-view").is_some()).await;
+
+    let mcp = McpServer::new(instances.clone());
+    mcp.set_session_view_json(Some("sim-view"), vec!["log".into()])
+        .unwrap();
+    let _view = session
+        .message()
+        .await
+        .expect("recv SetSessionView")
+        .expect("SetSessionView present");
+
+    session
+        .send(heartbeat_msg(42))
+        .await
+        .expect("send Heartbeat");
+    session.send(log_msg(4)).await.expect("send LogLine");
+    session
+        .send(input_observed_msg(5, InputSource::Human, "ENTER"))
+        .await
+        .expect("send human InputObserved");
+    session
+        .send(input_observed_msg(6, InputSource::Remote, "BACK"))
+        .await
+        .expect("send remote InputObserved");
+
+    let mut events = Vec::new();
+    for _ in 0..100 {
+        if let Ok(body) = mcp.observe_json(Some("sim-view"))
+            && let Some(batch) = body["events"].as_array()
+        {
+            events.extend(batch.iter().cloned());
+        }
+        let heartbeat_ready = instances
+            .get("sim-view")
+            .and_then(|snap| snap.last_heartbeat)
+            .is_some_and(|hb| hb.framebuffer_generation == 42);
+        if heartbeat_ready && events.iter().any(|event| event.get("log").is_some()) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(!events.is_empty(), "observe should return the unmasked log");
+    assert!(
+        events.iter().all(|event| event.get("log").is_some()),
+        "observe should only return log payloads, got {events:?}"
+    );
+    assert_eq!(
+        instances
+            .get("sim-view")
+            .unwrap()
+            .last_heartbeat
+            .unwrap()
+            .framebuffer_generation,
+        42
+    );
+
+    session.send(goodbye_msg()).await.expect("send Goodbye");
+    wait_until(|| instances.get("sim-view").is_none()).await;
+    session.close_send();
+}
+
+#[tokio::test]
+async fn snapshot_wait_completes_when_view_masks_snapshot() {
+    let (addr, instances) = start_listener().await;
+    let client = grpc_client(addr);
+    let mut session = client.session().await.expect("open Session");
+    session
+        .send(register_msg("sim-mask-snap"))
+        .await
+        .expect("send Register");
+    wait_until(|| instances.get("sim-mask-snap").is_some()).await;
+
+    let mcp = McpServer::new(instances.clone());
+    mcp.set_session_view_json(Some("sim-mask-snap"), vec!["log".into()])
+        .unwrap();
+    let _view = session
+        .message()
+        .await
+        .expect("recv SetSessionView")
+        .expect("SetSessionView present");
+
+    let waiter = tokio::spawn({
+        let mcp = mcp.clone();
+        async move {
+            mcp.request_snapshot_result(Some("sim-mask-snap"), false, 0, 0, 0, 0, 0, true)
+                .await
+        }
+    });
+    let outbound = session
+        .message()
+        .await
+        .expect("recv snapshot request")
+        .expect("snapshot request present")
+        .to_owned_message();
+    session
+        .send(SimToServer {
+            corr: outbound.corr,
+            payload: Some(
+                SnapshotFrame {
+                    pixels: vec![0x01],
+                    mime_type: "image/png".into(),
+                    ..Default::default()
+                }
+                .into(),
+            ),
+            ..Default::default()
+        })
+        .await
+        .expect("send SnapshotFrame");
+    let result = waiter.await.unwrap().unwrap();
+    assert_ne!(result.is_error, Some(true));
+    let observed = mcp.observe_json(Some("sim-mask-snap")).unwrap();
+    let events = observed["events"].as_array().unwrap();
+    assert!(
+        events.iter().all(|event| event.get("snapshot").is_none()),
+        "masked snapshot must not appear in observe: {events:?}"
+    );
     session.close_send();
 }

@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use csm_pb_bindings::generated::crosspoint::sim::control::v1alpha1::{
-    Heartbeat, Register, ServerToSim, SimToServer,
+    Heartbeat, Register, ServerToSim, SimToServer, sim_to_server,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -99,6 +99,8 @@ struct Instance {
     last_heartbeat: Option<Heartbeat>,
     inbound: InboundQueue,
     outbound_tx: mpsc::Sender<ServerToSim>,
+    /// Last `SetSessionView.read_mask` enqueued by MCP. Empty means emit all.
+    read_mask: Vec<String>,
 }
 
 /// Shared map of connected simulator sessions.
@@ -157,6 +159,7 @@ impl InstanceMap {
             last_heartbeat: None,
             inbound,
             outbound_tx,
+            read_mask: Vec::new(),
         };
         self.inner
             .lock()
@@ -288,6 +291,51 @@ impl InstanceMap {
             .map_err(|_| TrySendError::QueueFull)
     }
 
+    /// Store the host-side observe mask for `instance_id`.
+    ///
+    /// Paths are `SimToServer` payload names. An empty mask emits everything.
+    pub fn set_read_mask(&self, instance_id: &str, paths: Vec<String>) {
+        if let Some(inst) = self
+            .inner
+            .lock()
+            .expect("instance map lock")
+            .get_mut(instance_id)
+        {
+            inst.read_mask = paths;
+        }
+    }
+
+    /// Current observe mask, if the instance is connected.
+    pub fn read_mask(&self, instance_id: &str) -> Option<Vec<String>> {
+        self.inner
+            .lock()
+            .expect("instance map lock")
+            .get(instance_id)
+            .map(|inst| inst.read_mask.clone())
+    }
+
+    /// `SimToServer` oneof name used by `SetSessionView.read_mask`.
+    pub fn inbound_payload_name(msg: &SimToServer) -> Option<&'static str> {
+        match msg.payload.as_ref() {
+            Some(sim_to_server::Payload::Register(_)) => Some("register"),
+            Some(sim_to_server::Payload::Heartbeat(_)) => Some("heartbeat"),
+            Some(sim_to_server::Payload::Snapshot(_)) => Some("snapshot"),
+            Some(sim_to_server::Payload::SnapshotError(_)) => Some("snapshot_error"),
+            Some(sim_to_server::Payload::Log(_)) => Some("log"),
+            Some(sim_to_server::Payload::InputAck(_)) => Some("input_ack"),
+            Some(sim_to_server::Payload::InputObserved(_)) => Some("input_observed"),
+            Some(sim_to_server::Payload::Goodbye(_)) => Some("goodbye"),
+            None => None,
+        }
+    }
+
+    /// True when `observe` should emit `msg` for this mask.
+    pub fn inbound_visible(mask: &[String], msg: &SimToServer) -> bool {
+        mask.is_empty()
+            || Self::inbound_payload_name(msg)
+                .is_some_and(|name| mask.iter().any(|path| path == name))
+    }
+
     /// Pop one inbound envelope if present (tests and later MCP observe).
     pub fn try_recv_inbound(&self, instance_id: &str) -> Option<SimToServer> {
         self.inner
@@ -401,7 +449,9 @@ impl InboundSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use csm_pb_bindings::generated::crosspoint::sim::control::v1alpha1::ShutdownRequest;
+    use csm_pb_bindings::generated::crosspoint::sim::control::v1alpha1::{
+        Goodbye, InputAck, InputObserved, LogLine, ShutdownRequest, SnapshotError, SnapshotFrame,
+    };
 
     fn register(id: &str) -> Register {
         Register {
@@ -675,5 +725,91 @@ mod tests {
                 .unwrap_err(),
             WaitError::QueueFull
         );
+    }
+
+    #[test]
+    fn read_mask_defaults_empty_and_can_be_set() {
+        let map = InstanceMap::new();
+        assert!(map.read_mask("missing").is_none());
+        map.set_read_mask("missing", vec!["log".into()]);
+        insert_id(&map, "a");
+        assert_eq!(map.read_mask("a").unwrap(), Vec::<String>::new());
+        map.set_read_mask("a", vec!["log".into(), "goodbye".into()]);
+        assert_eq!(
+            map.read_mask("a").unwrap(),
+            vec!["log".to_string(), "goodbye".to_string()]
+        );
+    }
+
+    #[test]
+    fn inbound_visible_matches_payload_names() {
+        let named = [
+            (
+                SimToServer {
+                    payload: Some(register("a").into()),
+                    ..Default::default()
+                },
+                "register",
+            ),
+            (
+                SimToServer {
+                    payload: Some(Heartbeat::default().into()),
+                    ..Default::default()
+                },
+                "heartbeat",
+            ),
+            (
+                SimToServer {
+                    payload: Some(SnapshotFrame::default().into()),
+                    ..Default::default()
+                },
+                "snapshot",
+            ),
+            (
+                SimToServer {
+                    payload: Some(SnapshotError::default().into()),
+                    ..Default::default()
+                },
+                "snapshot_error",
+            ),
+            (
+                SimToServer {
+                    payload: Some(LogLine::default().into()),
+                    ..Default::default()
+                },
+                "log",
+            ),
+            (
+                SimToServer {
+                    payload: Some(InputAck::default().into()),
+                    ..Default::default()
+                },
+                "input_ack",
+            ),
+            (
+                SimToServer {
+                    payload: Some(InputObserved::default().into()),
+                    ..Default::default()
+                },
+                "input_observed",
+            ),
+            (
+                SimToServer {
+                    payload: Some(Goodbye::default().into()),
+                    ..Default::default()
+                },
+                "goodbye",
+            ),
+        ];
+        for (msg, name) in named {
+            assert_eq!(InstanceMap::inbound_payload_name(&msg), Some(name));
+            assert!(InstanceMap::inbound_visible(&[], &msg));
+            assert!(InstanceMap::inbound_visible(&[name.to_string()], &msg));
+            assert!(!InstanceMap::inbound_visible(&["other".into()], &msg));
+        }
+        let empty = SimToServer::default();
+        assert_eq!(InstanceMap::inbound_payload_name(&empty), None);
+        assert!(InstanceMap::inbound_visible(&[], &empty));
+        assert!(!InstanceMap::inbound_visible(&["log".into()], &empty));
     }
 }

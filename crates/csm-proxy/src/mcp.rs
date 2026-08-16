@@ -191,13 +191,16 @@ impl McpServer {
         Ok(Self::snapshot_json(&self.resolve(instance_id)?))
     }
 
-    /// Drain inbound envelopes for an instance.
+    /// Drain inbound envelopes for an instance, honoring the session view mask.
     pub fn observe_json(&self, instance_id: Option<&str>) -> Result<Value, String> {
         let snap = self.resolve(instance_id)?;
         let id = snap.register.instance_id;
+        let mask = self.instances.read_mask(&id).unwrap_or_default();
         let mut events = Vec::new();
         while let Some(msg) = self.instances.try_recv_inbound(&id) {
-            events.push(serde_json::to_value(&msg).unwrap_or(Value::Null));
+            if InstanceMap::inbound_visible(&mask, &msg) {
+                events.push(serde_json::to_value(&msg).unwrap_or(Value::Null));
+            }
         }
         Ok(json!({
             "instanceId": id,
@@ -366,24 +369,28 @@ impl McpServer {
         }
     }
 
-    /// Enqueue a session view mask.
+    /// Enqueue a session view mask and remember it for host-side observe.
     pub fn set_session_view_json(
         &self,
         instance_id: Option<&str>,
         paths: Vec<String>,
     ) -> Result<Value, String> {
-        self.enqueue(
-            instance_id,
+        let snap = self.resolve(instance_id)?;
+        let id = snap.register.instance_id;
+        let queued = self.enqueue(
+            Some(&id),
             false,
             SetSessionView {
                 read_mask: FieldMask {
-                    paths,
+                    paths: paths.clone(),
                     ..Default::default()
                 }
                 .into(),
                 ..Default::default()
             },
-        )
+        )?;
+        self.instances.set_read_mask(&id, paths);
+        Ok(queued)
     }
 
     /// Enqueue a shutdown request.
@@ -943,6 +950,41 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn observe_honors_session_view_mask() {
+        let map = InstanceMap::new();
+        let (_rx, sink) = insert(&map, "sim-a");
+        sink.push(SimToServer {
+            seq: 2,
+            payload: Some(
+                csm_pb_bindings::generated::crosspoint::sim::control::v1alpha1::LogLine {
+                    text: "keep".into(),
+                    ..Default::default()
+                }
+                .into(),
+            ),
+            ..Default::default()
+        });
+        sink.push(SimToServer {
+            seq: 3,
+            payload: Some(
+                InputObserved {
+                    source: InputSource::Human.into(),
+                    ..Default::default()
+                }
+                .into(),
+            ),
+            ..Default::default()
+        });
+        let mcp = McpServer::new(map);
+        mcp.set_session_view_json(Some("sim-a"), vec!["log".into()])
+            .unwrap();
+        let observed = mcp.observe_json(Some("sim-a")).unwrap();
+        let events = observed["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].get("log").is_some());
     }
 
     #[tokio::test]

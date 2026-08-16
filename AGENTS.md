@@ -29,6 +29,17 @@ This process is the MCP peer (`rmcp`). Default MCP transport is stdio
 The gRPC `Session` listener stays up either way. The simulator is not
 an MCP peer.
 
+Inject tools (`touch` / `key` / `home` / `swipe`) wait for a corr-matched
+`InputAck` by default. `request_snapshot` waits for `SnapshotFrame` or
+`SnapshotError` and returns MCP image content. Pass `wait: false` to
+enqueue only. `SetInjectEnabled`, `SetSessionView`, and
+`ShutdownRequest` stay fire-and-forget. `observe` drains inbound and
+honors the last `SetSessionView.read_mask` (SimToServer payload names:
+`register`, `heartbeat`, `snapshot`, `snapshot_error`, `log`,
+`input_ack`, `input_observed`, `goodbye`). An empty mask emits
+everything. Corr waiters still complete if the mask excludes that
+payload. Instance ids stay required as above.
+
 ## Simulator submodule
 
 Initial development includes a good target simulator as the

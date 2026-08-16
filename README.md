@@ -8,6 +8,12 @@ a simulator dials in. Default Session address is `127.0.0.1:50051`.
 On stdio, stdout is JSON-RPC only. Use stderr for logs. `--mcp-http`
 selects Streamable HTTP at `/mcp` instead of stdio.
 
+Inject tools and `request_snapshot` wait on the session by default
+(`InputAck`, or `SnapshotFrame` / `SnapshotError` as MCP image content).
+Pass `wait: false` to enqueue only. `observe` honors the last
+`SetSessionView` mask (SimToServer payload names). Tools that target a
+session still require an instance id unless `--default-instance` is set.
+
 | Flag | Env | Role |
 | --- | --- | --- |
 | `--listen` | `CSM_LISTEN` | gRPC Session listen address (default `127.0.0.1:50051`) |
