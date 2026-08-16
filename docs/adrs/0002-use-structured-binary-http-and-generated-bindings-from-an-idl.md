@@ -2,7 +2,7 @@
 number: 2
 title: Use structured binary HTTP and generated bindings from an IDL
 date: 2026-08-16
-status: proposed
+status: accepted
 tags:
 - rpc
 - idl

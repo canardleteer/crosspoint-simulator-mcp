@@ -2,7 +2,7 @@
 number: 5
 title: Accept inbound simulator connections and do not preclude spawning
 date: 2026-08-16
-status: proposed
+status: accepted
 tags:
 - process-model
 - architecture

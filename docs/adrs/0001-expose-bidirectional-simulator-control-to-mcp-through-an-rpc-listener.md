@@ -2,7 +2,7 @@
 number: 1
 title: Expose bidirectional simulator control to MCP through an RPC listener
 date: 2026-08-16
-status: proposed
+status: accepted
 tags:
 - mcp
 - rpc

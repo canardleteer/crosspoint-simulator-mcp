@@ -2,7 +2,7 @@
 number: 3
 title: Do not exclude IDL-available transports and serialization
 date: 2026-08-16
-status: proposed
+status: accepted
 tags:
 - rpc
 - idl

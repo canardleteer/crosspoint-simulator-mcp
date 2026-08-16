@@ -2,7 +2,7 @@
 number: 4
 title: Support multiple connected simulator instances
 date: 2026-08-16
-status: proposed
+status: accepted
 tags:
 - process-model
 - architecture
