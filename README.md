@@ -38,6 +38,39 @@ session still require an instance id unless `--default-instance` is set.
 | `--observe-wait-ms` | `CSM_OBSERVE_WAIT_MS` | Default `observe` timeout when an until-condition is set and `wait_ms` is omitted (default 8000) |
 | | `RUST_LOG` | `tracing` filter (default `csm_proxy=info` when unset) |
 
+The `crosspoint-simulator` submodule is a **library** the consuming
+firmware links. It is not a `program` this server can exec. `start_instance`
+needs a firmware binary built with `-DCROSSPOINT_SIM_GRPC` against protobuf
+35 / grpc++ 1.83. The README `cargo run` lines below only start the MCP
+and Session listeners; they do not build firmware or set `--simulator`.
+
+Local Session testing (HTTP MCP, `--simulator` when `--firmware` names a
+firmware tree or `program`) is:
+
+```bash
+# Build csm-proxy if needed and exec the test proxy
+cargo xtask start-csm-proxy
+
+# Operator-local display, grpc++ libs, and firmware (not stored in git)
+cargo xtask start-csm-proxy \
+  --firmware /path/to/firmware \
+  --display "$DISPLAY" \
+  --ld-library-path /path/to/grpc/lib
+
+# Host-launched stdio MCP: xtask builds, then execs the proxy so cargo
+# never owns stdout. JSON-RPC stays on stdout; logs stay on stderr.
+cargo xtask start-csm-proxy --mode=stdio
+```
+
+`--mode` is `http` (default, `http://127.0.0.1:8765/mcp`) or `stdio`.
+`--firmware`, `--display` / `CSM_DISPLAY`, and `--ld-library-path` /
+`CSM_LD_LIBRARY_PATH` are operator-local. They apply only to the exec'd
+proxy, have no implied machine values, and must not be committed.
+`--grpc-prefix` is only for `pio` `PKG_CONFIG_PATH` when this task builds
+firmware. Pass extra proxy flags after `--` (for example `-- --auto-sleep`).
+
+Inbound-only (no firmware, no `start_instance`):
+
 ```bash
 # Host-launched MCP (stdio) plus Session listener
 cargo run -p csm-proxy -- --listen 127.0.0.1:50051

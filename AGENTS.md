@@ -91,6 +91,12 @@ parse `std::env::args` by hand when clap can express the interface.
 
 Workspace maintenance lives in the `xtask` crate. Run it as
 `cargo xtask <command>` (see `.cargo/config.toml`).
+`cargo xtask start-csm-proxy` builds `csm-proxy` if needed and execs the
+proxy (HTTP MCP by default). `--firmware`, `--display`,
+`--ld-library-path`, and `--grpc-prefix` are operator-local: pass them
+or set `CSM_*` in the launching environment. Do not commit machine
+paths, display numbers, or library prefixes. Use `--mode=stdio` only
+after that exec; do not `cargo run -p csm-proxy` for stdio MCP.
 
 ## Coverage
 

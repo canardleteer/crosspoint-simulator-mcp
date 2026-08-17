@@ -135,7 +135,8 @@ Do not busy-loop with sleeps.
 not build firmware. Rebuild the consuming firmware `program` in place,
 then start a **new** instance. Do not stop this MCP/Session process to
 pick up a new `program`. This agent cannot restart the proxy; queue
-follow-up work around a human restart.
+follow-up work around a human restart. Operators start the test proxy
+with `cargo xtask start-csm-proxy` (HTTP MCP by default).
 
 `sample_book` (default true) seeds `fs_/books/CrossPoint-Reader.epub`.
 Pass `headless: false` when a human should see the SDL window.

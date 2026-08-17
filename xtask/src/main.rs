@@ -1,10 +1,14 @@
 //! Workspace maintenance tasks. Run as `cargo xtask <command>`.
 
+mod start;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
 use clap::{Parser, Subcommand};
+
+use start::StartCsmProxyArgs;
 
 /// Line coverage must be strictly greater than this percent.
 const MIN_LINE_COVERAGE_PERCENT: f64 = 90.0;
@@ -33,6 +37,8 @@ enum Task {
     Coverage(CoverageArgs),
     /// Generate C++ protobuf and grpc++ stubs into the simulator submodule.
     GenerateSimCpp,
+    /// Build csm-proxy (and firmware if needed) and start the test proxy.
+    StartCsmProxy(StartCsmProxyArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -233,6 +239,7 @@ fn main() -> ExitCode {
     let result = match args.command {
         Task::Coverage(coverage) => run_coverage(coverage),
         Task::GenerateSimCpp => run_generate_sim_cpp(),
+        Task::StartCsmProxy(start) => start::run(workspace_root(), start),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
