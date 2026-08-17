@@ -584,11 +584,25 @@ async fn observe_honors_session_view_and_keeps_heartbeat() {
     let mcp = McpServer::new(instances.clone());
     mcp.set_session_view_json(Some("sim-view"), vec!["log".into()])
         .unwrap();
-    let _view = session
+    let view = session
         .message()
         .await
         .expect("recv SetSessionView")
-        .expect("SetSessionView present");
+        .expect("SetSessionView present")
+        .to_owned_message();
+    match view.payload {
+        Some(server_to_sim::Payload::SetSessionView(view)) => {
+            let paths = view
+                .read_mask
+                .as_option()
+                .expect("read_mask")
+                .paths
+                .clone();
+            assert!(paths.contains(&"log".into()), "{paths:?}");
+            assert!(paths.contains(&"heartbeat".into()), "{paths:?}");
+        }
+        other => panic!("{other:?}"),
+    }
 
     session
         .send(heartbeat_msg(42))

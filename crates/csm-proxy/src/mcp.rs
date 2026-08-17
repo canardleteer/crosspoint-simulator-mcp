@@ -58,6 +58,8 @@ inject_key, inject_home, and inject_swipe wait for InputAck unless wait is false
 request_snapshot waits for a PNG SnapshotFrame. observe drains inbound events including \
 human and remote InputObserved. Pass until_log and/or until_generation_gt to wait; \
 wait_ms overrides the process default (--observe-wait-ms / CSM_OBSERVE_WAIT_MS, 8000). \
+A non-empty set_session_view still receives heartbeats so get_instance.lastHeartbeat \
+and until_generation_gt keep working; observe omits them unless heartbeat is in the mask. \
 InputAck means the inject was queued, not that the panel \
 painted; after inject, observe for ACT/ERS/GFX logs or a framebufferGeneration bump. \
 Do not sleep as synchronization. Tap (inject_touch) when Register.capTouch is true; \
@@ -150,6 +152,7 @@ impl McpServer {
                 "waitMsDefault": crate::spawn::DEFAULT_OBSERVE_WAIT_MS,
                 "untilLogParam": "until_log",
                 "untilGenerationGtParam": "until_generation_gt",
+                "heartbeatAlwaysOnWire": true,
             },
             "firmware": {
                 "compileTime": true,
@@ -544,6 +547,10 @@ impl McpServer {
     }
 
     /// Enqueue a session view mask and remember it for host-side observe.
+    ///
+    /// The host observe mask is exactly `paths`. A non-empty wire mask also
+    /// includes `heartbeat` so `lastHeartbeat` and `until_generation_gt` still
+    /// advance when observe omits heartbeats.
     pub fn set_session_view_json(
         &self,
         instance_id: Option<&str>,
@@ -556,7 +563,7 @@ impl McpServer {
             false,
             SetSessionView {
                 read_mask: FieldMask {
-                    paths: paths.clone(),
+                    paths: wire_session_view_paths(&paths),
                     ..Default::default()
                 }
                 .into(),
@@ -687,6 +694,16 @@ fn default_headless() -> bool {
 
 fn default_sample_book() -> bool {
     true
+}
+
+/// Host observe mask is `paths`. A non-empty wire mask also includes heartbeat.
+fn wire_session_view_paths(paths: &[String]) -> Vec<String> {
+    if paths.is_empty() || paths.iter().any(|path| path == "heartbeat") {
+        return paths.to_vec();
+    }
+    let mut wire = paths.to_vec();
+    wire.push("heartbeat".into());
+    wire
 }
 
 fn observe_until_matched(
@@ -1020,7 +1037,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Set which SimToServer payloads observe should emit (read_mask names: register, heartbeat, snapshot, snapshot_error, log, input_ack, input_observed, goodbye). Empty mask emits everything."
+        description = "Set which SimToServer payloads observe should emit (read_mask names: register, heartbeat, snapshot, snapshot_error, log, input_ack, input_observed, goodbye). Empty mask emits everything. A non-empty mask still receives heartbeats on the wire so lastHeartbeat advances."
     )]
     fn set_session_view(
         &self,
@@ -1063,7 +1080,7 @@ impl McpServer {
 #[tool_handler(
     name = "crosspoint-simulator-mcp-proxy",
     version = "0.1.0",
-    instructions = "Control and observe eBook firmware simulator instances over Session. A session appears when a simulator dials this process, or when start_instance launches the operator-configured --simulator binary. This server does not build firmware or accept a client-supplied binary path. Board and compile-time firmware options stay in the binary; Register reports them after connect. Tools that target a session require instance_id (1-64 bytes) unless --default-instance is set. Do not omit an id when only one simulator is connected. start_instance always requires an explicit instance_id and defaults to headless. sample_book (default true) seeds fs_/books/CrossPoint-Reader.epub from the committed README fixture; pass false for an empty library. auto_sleep (default false, or --auto-sleep / CSM_AUTO_SLEEP) seeds fs_/.crosspoint/settings.json with sleepTimeoutMinutes 31 (never); pass true to keep firmware's 10-minute idle sleep. Use list_instances and get_instance to see connected peers. inject_touch, inject_key, inject_home, and inject_swipe wait for InputAck unless wait is false. request_snapshot waits for a PNG SnapshotFrame. observe drains inbound events including human and remote InputObserved. Pass until_log and/or until_generation_gt to wait; wait_ms overrides the process default (--observe-wait-ms / CSM_OBSERVE_WAIT_MS, 8000). InputAck means the inject was queued, not that the panel painted; after inject, observe for ACT/ERS/GFX logs or a framebufferGeneration bump. Do not sleep as synchronization. Tap (inject_touch) when Register.capTouch is true; default X4 has no touch and no Home. shutdown_instance sends ShutdownRequest and reaps a child this server started. Read csm://capabilities for the machine-readable surface. csm://instances lists connections; csm://instances/{id} is one snapshot."
+    instructions = "Control and observe eBook firmware simulator instances over Session. A session appears when a simulator dials this process, or when start_instance launches the operator-configured --simulator binary. This server does not build firmware or accept a client-supplied binary path. Board and compile-time firmware options stay in the binary; Register reports them after connect. Tools that target a session require instance_id (1-64 bytes) unless --default-instance is set. Do not omit an id when only one simulator is connected. start_instance always requires an explicit instance_id and defaults to headless. sample_book (default true) seeds fs_/books/CrossPoint-Reader.epub from the committed README fixture; pass false for an empty library. auto_sleep (default false, or --auto-sleep / CSM_AUTO_SLEEP) seeds fs_/.crosspoint/settings.json with sleepTimeoutMinutes 31 (never); pass true to keep firmware's 10-minute idle sleep. Use list_instances and get_instance to see connected peers. inject_touch, inject_key, inject_home, and inject_swipe wait for InputAck unless wait is false. request_snapshot waits for a PNG SnapshotFrame. observe drains inbound events including human and remote InputObserved. Pass until_log and/or until_generation_gt to wait; wait_ms overrides the process default (--observe-wait-ms / CSM_OBSERVE_WAIT_MS, 8000). A non-empty set_session_view still receives heartbeats so get_instance.lastHeartbeat and until_generation_gt keep working; observe omits them unless heartbeat is in the mask. InputAck means the inject was queued, not that the panel painted; after inject, observe for ACT/ERS/GFX logs or a framebufferGeneration bump. Do not sleep as synchronization. Tap (inject_touch) when Register.capTouch is true; default X4 has no touch and no Home. shutdown_instance sends ShutdownRequest and reaps a child this server started. Read csm://capabilities for the machine-readable surface. csm://instances lists connections; csm://instances/{id} is one snapshot."
 )]
 impl ServerHandler for McpServer {
     fn get_info(&self) -> ServerInfo {
@@ -1403,6 +1420,79 @@ mod tests {
         let events = observed["events"].as_array().unwrap();
         assert_eq!(events.len(), 1);
         assert!(events[0].get("log").is_some());
+    }
+
+    #[test]
+    fn wire_session_view_paths_keeps_heartbeat_on_a_non_empty_mask() {
+        assert_eq!(wire_session_view_paths(&[]), Vec::<String>::new());
+        assert_eq!(
+            wire_session_view_paths(&["log".into()]),
+            vec!["log", "heartbeat"]
+        );
+        assert_eq!(
+            wire_session_view_paths(&["log".into(), "heartbeat".into()]),
+            vec!["log", "heartbeat"]
+        );
+    }
+
+    #[test]
+    fn set_session_view_keeps_host_mask_and_unions_heartbeat_on_the_wire() {
+        let map = InstanceMap::new();
+        let (mut rx, _sink) = insert(&map, "sim-a");
+        let mcp = McpServer::new(map.clone());
+        mcp.set_session_view_json(Some("sim-a"), vec!["log".into()])
+            .unwrap();
+        assert_eq!(map.read_mask("sim-a").unwrap(), vec!["log".to_string()]);
+        match rx.try_recv().unwrap().payload {
+            Some(server_to_sim::Payload::SetSessionView(view)) => {
+                let paths = view
+                    .read_mask
+                    .as_option()
+                    .expect("read_mask")
+                    .paths
+                    .clone();
+                assert_eq!(paths, vec!["log", "heartbeat"]);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn observe_wait_generation_works_after_a_log_only_view() {
+        let map = InstanceMap::new();
+        let (tx, mut rx) = mpsc::channel(8);
+        let (token, _sink) = map.insert(register("sim-a"), 8, tx);
+        let mcp = McpServer::new(map.clone());
+        mcp.set_session_view_json(Some("sim-a"), vec!["log".into()])
+            .unwrap();
+        assert_eq!(map.read_mask("sim-a").unwrap(), vec!["log".to_string()]);
+        match rx.try_recv().unwrap().payload {
+            Some(server_to_sim::Payload::SetSessionView(view)) => {
+                assert!(
+                    view.read_mask
+                        .as_option()
+                        .expect("read_mask")
+                        .paths
+                        .iter()
+                        .any(|path| path == "heartbeat")
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        map.set_heartbeat(
+            "sim-a",
+            token,
+            Heartbeat {
+                framebuffer_generation: 6,
+                ..Default::default()
+            },
+        );
+        let generation = mcp
+            .observe_wait_json(Some("sim-a"), Some(50), None, Some(5))
+            .await
+            .unwrap();
+        assert_eq!(generation["matched"], true);
+        assert_eq!(generation["timedOut"], false);
     }
 
     #[tokio::test]
@@ -1813,6 +1903,7 @@ mod tests {
         assert!(instructions.contains("sample_book"));
         assert!(instructions.contains("auto_sleep"));
         assert!(instructions.contains("until_log"));
+        assert!(instructions.contains("lastHeartbeat"));
         assert!(instructions.contains("framebufferGeneration"));
         assert!(instructions.contains("capTouch"));
         assert!(instructions.contains("csm://capabilities"));
@@ -1826,6 +1917,7 @@ mod tests {
         assert_eq!(caps["spawn"]["autoSleep"]["neverMinutes"], 31);
         assert_eq!(caps["observe"]["waitMsDefault"], 8000);
         assert_eq!(caps["observe"]["untilLogParam"], "until_log");
+        assert_eq!(caps["observe"]["heartbeatAlwaysOnWire"], true);
         assert_eq!(
             caps["spawn"]["sampleBook"]["filename"],
             "CrossPoint-Reader.epub"

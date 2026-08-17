@@ -119,7 +119,8 @@ full, and a non-empty `set_session_view` mask is applied at enqueue so
 masked heartbeats never occupy a slot. Still call `observe` right after
 inject if you need the completion lines. Prefer `set_session_view`
 paths `log`, `input_ack`, `input_observed` while driving, and read
-generation from `get_instance`.
+generation from `get_instance`. Heartbeats still arrive on the wire so
+`lastHeartbeat` advances even when observe omits them.
 
 `observe` waits when you pass `until_log` (substring of `log.text`)
 and/or `until_generation_gt` (succeeds if
