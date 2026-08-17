@@ -33,8 +33,9 @@ pub struct StartCsmProxyArgs {
     #[arg(long, env = "CSM_BOARD", default_value = "simulator")]
     pub board: String,
 
-    /// Local protobuf 35 / grpc++ 1.83 prefix (`lib/pkgconfig`) for `pio` only.
-    /// Does not set `LD_LIBRARY_PATH`; use `--ld-library-path`.
+    /// Local protobuf 35 / grpc++ 1.83 prefix (`lib/pkgconfig`) for `pio`.
+    /// Also prepends `{prefix}/lib` to `pio`'s `LD_LIBRARY_PATH` / `LIBRARY_PATH`.
+    /// Does not set those on the exec'd proxy; use `--ld-library-path`.
     #[arg(long, env = "CSM_GRPC_PREFIX")]
     pub grpc_prefix: Option<PathBuf>,
 
@@ -50,8 +51,9 @@ pub struct StartCsmProxyArgs {
     #[arg(long, env = "CSM_DISPLAY")]
     pub display: Option<String>,
 
-    /// Prepend to `LD_LIBRARY_PATH` on the exec'd proxy only. Repeatable.
-    /// Inherited from the caller if omitted. Does not invent a grpc++ prefix.
+    /// Prepend to `LD_LIBRARY_PATH` on the exec'd proxy, and on `pio` when
+    /// this task builds firmware. Repeatable. Inherited from the caller if
+    /// omitted. Does not invent a grpc++ prefix.
     #[arg(long, env = "CSM_LD_LIBRARY_PATH", value_delimiter = ':')]
     pub ld_library_path: Vec<PathBuf>,
 
@@ -77,7 +79,6 @@ pub struct StartPlan {
     pub ld_library_path: Vec<PathBuf>,
     pub extra: Vec<String>,
 }
-
 
 /// `program` path, or the file itself when `firmware` is already a binary.
 pub fn program_path(firmware: &Path, board: &str) -> PathBuf {
@@ -175,7 +176,12 @@ fn build_proxy(root: &Path) -> Result<PathBuf, String> {
     Ok(bin)
 }
 
-fn build_firmware(firmware: &Path, board: &str, grpc_prefix: Option<&Path>) -> Result<(), String> {
+fn build_firmware(
+    firmware: &Path,
+    board: &str,
+    grpc_prefix: Option<&Path>,
+    ld_library_path: &[PathBuf],
+) -> Result<(), String> {
     log(format!(
         "building firmware env {board} in {}",
         firmware.display()
@@ -185,6 +191,7 @@ fn build_firmware(firmware: &Path, board: &str, grpc_prefix: Option<&Path>) -> R
         .current_dir(firmware)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
+    let mut search = ld_library_path.to_vec();
     if let Some(prefix) = grpc_prefix {
         let pc = prefix.join("lib").join("pkgconfig");
         let old = env::var("PKG_CONFIG_PATH").unwrap_or_default();
@@ -194,6 +201,19 @@ fn build_firmware(firmware: &Path, board: &str, grpc_prefix: Option<&Path>) -> R
             format!("{}:{old}", pc.display())
         };
         cmd.env("PKG_CONFIG_PATH", merged);
+        search.push(prefix.join("lib"));
+    }
+    if !search.is_empty() {
+        let ld = env::var("LD_LIBRARY_PATH").ok();
+        cmd.env(
+            "LD_LIBRARY_PATH",
+            prepend_ld_library_path(&search, ld.as_deref()),
+        );
+        let library = env::var("LIBRARY_PATH").ok();
+        cmd.env(
+            "LIBRARY_PATH",
+            prepend_ld_library_path(&search, library.as_deref()),
+        );
     }
     run_status(cmd, "pio run")
 }
@@ -217,7 +237,7 @@ fn resolve_simulator(
     }
     let program = program_path(&firmware, &args.board);
     if args.build_firmware || !program.is_file() {
-        build_firmware(&firmware, &args.board, grpc_prefix)?;
+        build_firmware(&firmware, &args.board, grpc_prefix, &args.ld_library_path)?;
     }
     if !program.is_file() {
         return Err(format!(
@@ -232,7 +252,10 @@ fn resolve_simulator(
 
 pub fn plan(root: &Path, args: StartCsmProxyArgs) -> Result<StartPlan, String> {
     if let Some(prefix) = &args.grpc_prefix {
-        log(format!("grpc prefix {} (pio PKG_CONFIG_PATH only)", prefix.display()));
+        log(format!(
+            "grpc prefix {} (pio pkg-config and link search)",
+            prefix.display()
+        ));
     }
     let proxy_bin = build_proxy(root)?;
     let simulator = resolve_simulator(&args, args.grpc_prefix.as_deref())?;
