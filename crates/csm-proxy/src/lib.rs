@@ -23,8 +23,9 @@ pub use mcp::{
 };
 pub use session::SessionService;
 pub use spawn::{
-    SAMPLE_BOOK_EPUB, SAMPLE_BOOK_FILENAME, SPAWN_WAIT, SpawnConfig, SpawnError, SpawnSupervisor,
-    default_cwd, seed_sample_book, spawn_argv,
+    DEFAULT_OBSERVE_WAIT_MS, NEVER_SLEEP_TIMEOUT_MINUTES, SAMPLE_BOOK_EPUB, SAMPLE_BOOK_FILENAME,
+    SETTINGS_RELATIVE, SPAWN_WAIT, SpawnConfig, SpawnError, SpawnSupervisor, default_cwd,
+    seed_never_sleep_settings, seed_sample_book, spawn_argv,
 };
 
 /// Bind and serve inbound `Session` on `addr` until the process exits.

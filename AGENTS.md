@@ -22,7 +22,10 @@ and `--sim-headless` when requested). `start_instance` requires an
 explicit instance id (1–64 bytes) and defaults to headless. It also
 defaults to seeding the committed sample EPUB
 (`fs_/books/CrossPoint-Reader.epub`, from the CrossPoint Reader
-README) unless `sample_book` is false. This process does not
+README) unless `sample_book` is false. `auto_sleep` defaults to false
+and seeds `fs_/.crosspoint/settings.json` with `sleepTimeoutMinutes`
+31 (never); pass true, or set `--auto-sleep` / `CSM_AUTO_SLEEP`, to
+keep firmware's 10-minute idle sleep. This process does not
 auto-start a simulator on boot.
 
 Instance ids are required and cannot be empty: `Register.instance_id`
@@ -48,8 +51,11 @@ enqueue only. `SetInjectEnabled`, `SetSessionView`, and
 honors the last `SetSessionView.read_mask` (SimToServer payload names:
 `register`, `heartbeat`, `snapshot`, `snapshot_error`, `log`,
 `input_ack`, `input_observed`, `goodbye`). An empty mask emits
-everything. Corr waiters still complete if the mask excludes that
-payload. Instance ids stay required as above.
+everything. Optional `until_log` and `until_generation_gt` wait until
+any condition matches or `wait_ms` elapses (`--observe-wait-ms` /
+`CSM_OBSERVE_WAIT_MS` when `wait_ms` is omitted). Corr waiters still
+complete if the mask excludes that payload. Instance ids stay required
+as above.
 
 When testing CrossPoint Reader in the simulator over MCP, read
 [`.agents/skills/navigating-as-an-agent/SKILL.md`](.agents/skills/navigating-as-an-agent/SKILL.md).

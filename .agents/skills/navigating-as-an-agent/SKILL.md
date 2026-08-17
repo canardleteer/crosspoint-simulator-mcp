@@ -71,8 +71,11 @@ until it redials (new pid). Do not treat that as a proxy crash.
 
 While driving: keep injecting, or send `POWER` after those log lines if
 you still need the instance. Prefer shutting down when idle.
-`start_instance` can seed a never-sleep settings file; see that tool's
-`auto_sleep` flag when present.
+
+`start_instance` defaults to `auto_sleep: false` and seeds
+`fs_/.crosspoint/settings.json` with `sleepTimeoutMinutes` 31 (never).
+Pass `auto_sleep: true` only when you want the firmware 10-minute idle
+sleep. The process default is `--auto-sleep` / `CSM_AUTO_SLEEP`.
 
 ## Touch when the board has it
 
@@ -118,8 +121,13 @@ inject if you need the completion lines. Prefer `set_session_view`
 paths `log`, `input_ack`, `input_observed` while driving, and read
 generation from `get_instance`.
 
-`observe` can wait for a log substring or a generation bump when those
-parameters are present; do not busy-loop with sleeps.
+`observe` waits when you pass `until_log` (substring of `log.text`)
+and/or `until_generation_gt` (succeeds if
+`lastHeartbeat.framebufferGeneration` is greater). Either condition
+is enough. `wait_ms` is the timeout; omit it to use
+`--observe-wait-ms` / `CSM_OBSERVE_WAIT_MS` (default 8000). `wait_ms: 0`
+is a one-shot drain. The response includes `matched` and `timedOut`.
+Do not busy-loop with sleeps.
 
 ## Spawn and rebuild
 
@@ -132,4 +140,4 @@ follow-up work around a human restart.
 `sample_book` (default true) seeds `fs_/books/CrossPoint-Reader.epub`.
 Pass `headless: false` when a human should see the SDL window.
 Pass `auto_sleep: true` only when you want the firmware 10-minute
-idle sleep; default is off for spawned instances.
+idle sleep; default is off (never-sleep settings) for spawned instances.

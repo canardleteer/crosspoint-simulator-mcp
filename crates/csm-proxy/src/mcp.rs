@@ -49,11 +49,16 @@ Register reports them after connect. Tools that target a session require instanc
 (1-64 bytes) unless --default-instance is set. Do not omit an id when only one simulator \
 is connected. start_instance always requires an explicit instance_id and defaults to \
 headless. sample_book (default true) seeds fs_/books/CrossPoint-Reader.epub from the \
-committed README fixture; pass false for an empty library. Use list_instances and \
+committed README fixture; pass false for an empty library. auto_sleep (default false, \
+or --auto-sleep / CSM_AUTO_SLEEP) seeds fs_/.crosspoint/settings.json with \
+sleepTimeoutMinutes 31 (never); pass true to keep firmware's 10-minute idle sleep. \
+Use list_instances and \
 get_instance to see connected peers. inject_touch, \
 inject_key, inject_home, and inject_swipe wait for InputAck unless wait is false. \
 request_snapshot waits for a PNG SnapshotFrame. observe drains inbound events including \
-human and remote InputObserved. InputAck means the inject was queued, not that the panel \
+human and remote InputObserved. Pass until_log and/or until_generation_gt to wait; \
+wait_ms overrides the process default (--observe-wait-ms / CSM_OBSERVE_WAIT_MS, 8000). \
+InputAck means the inject was queued, not that the panel \
 painted; after inject, observe for ACT/ERS/GFX logs or a framebufferGeneration bump. \
 Do not sleep as synchronization. Tap (inject_touch) when Register.capTouch is true; \
 default X4 has no touch and no Home. shutdown_instance sends ShutdownRequest and reaps a child \
@@ -130,14 +135,35 @@ impl McpServer {
                     "sdPath": "/books/CrossPoint-Reader.epub",
                     "source": "https://github.com/canardleteer/crosspoint-reader/blob/develop/README.md",
                 },
+                "autoSleepDefault": false,
+                "autoSleep": {
+                    "param": "auto_sleep",
+                    "neverMinutes": crate::spawn::NEVER_SLEEP_TIMEOUT_MINUTES,
+                    "firmwareDefaultMinutes": 10,
+                    "settingsPath": crate::spawn::SETTINGS_RELATIVE,
+                },
                 "clientPassesBinary": false,
                 "firmwareBuild": false,
+            },
+            "observe": {
+                "waitMsParam": "wait_ms",
+                "waitMsDefault": crate::spawn::DEFAULT_OBSERVE_WAIT_MS,
+                "untilLogParam": "until_log",
+                "untilGenerationGtParam": "until_generation_gt",
             },
             "firmware": {
                 "compileTime": true,
                 "see": "Register",
             },
         })
+    }
+
+    /// `csm://capabilities` using this process's spawn and observe defaults.
+    pub fn capabilities_document(&self) -> Value {
+        let mut caps = Self::capabilities_json(self.spawn.configured());
+        caps["spawn"]["autoSleepDefault"] = json!(self.spawn.auto_sleep_default());
+        caps["observe"]["waitMsDefault"] = json!(self.spawn.observe_wait_ms());
+        caps
     }
 
     fn resolve(&self, instance_id: Option<&str>) -> Result<InstanceSnapshot, String> {
@@ -285,6 +311,65 @@ impl McpServer {
 
     /// Drain inbound envelopes for an instance, honoring the session view mask.
     pub fn observe_json(&self, instance_id: Option<&str>) -> Result<Value, String> {
+        let (id, events) = self.drain_observe(instance_id)?;
+        tracing::debug!(instance_id = %id, events = events.len(), "observe drain");
+        Ok(json!({
+            "instanceId": id,
+            "events": events,
+        }))
+    }
+
+    /// Drain, optionally waiting for a log substring and/or a generation bump.
+    ///
+    /// Succeeds when any specified until-condition matches. `wait_ms` `0` or
+    /// omitted with no until-condition is a one-shot drain. Omitted `wait_ms`
+    /// with an until-condition uses the process default.
+    pub async fn observe_wait_json(
+        &self,
+        instance_id: Option<&str>,
+        wait_ms: Option<u32>,
+        until_log: Option<&str>,
+        until_generation_gt: Option<u64>,
+    ) -> Result<Value, String> {
+        let until_log = until_log.filter(|text| !text.is_empty());
+        let waiting = until_log.is_some() || until_generation_gt.is_some();
+        let timeout_ms = match wait_ms {
+            Some(ms) => ms,
+            None if waiting => self.spawn.observe_wait_ms(),
+            None => 0,
+        };
+        let (id, mut events) = self.drain_observe(instance_id)?;
+        let deadline = Instant::now() + Duration::from_millis(u64::from(timeout_ms));
+        loop {
+            let generation = self.instances.get(&id).and_then(|snap| {
+                snap.last_heartbeat
+                    .as_ref()
+                    .map(|hb| hb.framebuffer_generation)
+            });
+            let matched =
+                observe_until_matched(until_log, until_generation_gt, &events, generation);
+            let timed_out = Instant::now() >= deadline;
+            if (waiting && (matched || timed_out)) || (!waiting && timed_out) {
+                tracing::debug!(
+                    instance_id = %id,
+                    events = events.len(),
+                    matched,
+                    waiting,
+                    "observe wait"
+                );
+                return Ok(json!({
+                    "instanceId": id,
+                    "events": events,
+                    "matched": matched,
+                    "timedOut": waiting && !matched,
+                }));
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            events.extend(self.drain_observe(Some(&id))?.1);
+        }
+    }
+
+    fn drain_observe(&self, instance_id: Option<&str>) -> Result<(String, Vec<Value>), String> {
         let snap = self.resolve(instance_id)?;
         let id = snap.register.instance_id;
         let mask = self.instances.read_mask(&id).unwrap_or_default();
@@ -294,11 +379,7 @@ impl McpServer {
                 events.push(serde_json::to_value(&msg).unwrap_or(Value::Null));
             }
         }
-        tracing::debug!(instance_id = %id, events = events.len(), "observe drain");
-        Ok(json!({
-            "instanceId": id,
-            "events": events,
-        }))
+        Ok((id, events))
     }
 
     /// Inject a touch edge. When `wait` is true, wait for `InputAck`.
@@ -506,6 +587,7 @@ impl McpServer {
         headless: bool,
         cwd: Option<&str>,
         sample_book: bool,
+        auto_sleep: bool,
     ) -> Result<Value, String> {
         if !crate::is_valid_instance_id(instance_id) {
             return Err(SpawnError::InvalidId.as_str());
@@ -520,6 +602,7 @@ impl McpServer {
                 cwd_path.as_deref(),
                 connected,
                 sample_book,
+                auto_sleep,
             )
             .await
             .map_err(|err| {
@@ -535,6 +618,8 @@ impl McpServer {
                     "pid": pid,
                     "register": snap.register,
                     "lastHeartbeat": snap.last_heartbeat,
+                    "sampleBook": sample_book,
+                    "autoSleep": auto_sleep,
                 }));
             }
             if !self.spawn.is_alive(instance_id) {
@@ -602,6 +687,35 @@ fn default_headless() -> bool {
 
 fn default_sample_book() -> bool {
     true
+}
+
+fn observe_until_matched(
+    until_log: Option<&str>,
+    until_generation_gt: Option<u64>,
+    events: &[Value],
+    generation: Option<u64>,
+) -> bool {
+    let mut any = false;
+    let mut hit = false;
+    if let Some(needle) = until_log {
+        any = true;
+        if events.iter().any(|event| {
+            event
+                .get("log")
+                .and_then(|log| log.get("text"))
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.contains(needle))
+        }) {
+            hit = true;
+        }
+    }
+    if let Some(min) = until_generation_gt {
+        any = true;
+        if generation.is_some_and(|value| value > min) {
+            hit = true;
+        }
+    }
+    !any || hit
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -737,6 +851,28 @@ struct StartInstanceParams {
     /// into `fs_/books/` under the instance working directory.
     #[serde(default = "default_sample_book")]
     sample_book: bool,
+    /// When true, keep firmware's 10-minute idle auto-sleep. When false or
+    /// omitted, use `--auto-sleep` / `CSM_AUTO_SLEEP` (default false) and seed
+    /// never-sleep settings (`sleepTimeoutMinutes` 31).
+    #[serde(default)]
+    auto_sleep: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ObserveParams {
+    /// Instance id (1–64 bytes). Required unless `--default-instance` is set.
+    #[serde(default)]
+    instance_id: Option<String>,
+    /// Timeout in milliseconds. `0` is a one-shot drain. Omitted with an
+    /// until-condition uses `--observe-wait-ms` / `CSM_OBSERVE_WAIT_MS`.
+    #[serde(default)]
+    wait_ms: Option<u32>,
+    /// Succeed when a drained `log.text` contains this substring.
+    #[serde(default)]
+    until_log: Option<String>,
+    /// Succeed when `lastHeartbeat.framebufferGeneration` is greater than this.
+    #[serde(default)]
+    until_generation_gt: Option<u64>,
 }
 
 #[tool_router]
@@ -759,18 +895,22 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Start the operator-configured --simulator binary and wait for Register. Requires an explicit instance_id. Defaults to headless. sample_book (default true) seeds fs_/books/CrossPoint-Reader.epub from the committed README fixture. Fails if spawn is not configured, the id is already connected, or Register times out. Does not build firmware."
+        description = "Start the operator-configured --simulator binary and wait for Register. Requires an explicit instance_id. Defaults to headless. sample_book (default true) seeds fs_/books/CrossPoint-Reader.epub from the committed README fixture. auto_sleep (default false, or --auto-sleep) seeds never-sleep settings; pass true for firmware's 10-minute idle sleep. Fails if spawn is not configured, the id is already connected, or Register times out. Does not build firmware."
     )]
     async fn start_instance(
         &self,
         Parameters(params): Parameters<StartInstanceParams>,
     ) -> Result<CallToolResult, McpError> {
+        let auto_sleep = params
+            .auto_sleep
+            .unwrap_or_else(|| self.spawn.auto_sleep_default());
         Self::tool_result(
             self.start_instance_json(
                 &params.instance_id,
                 params.headless,
                 params.cwd.as_deref(),
                 params.sample_book,
+                auto_sleep,
             )
             .await,
         )
@@ -902,20 +1042,28 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Drain inbound session events for the named instance, including human and remote InputObserved. Honors the last set_session_view mask."
+        description = "Drain inbound session events for the named instance, including human and remote InputObserved. Honors the last set_session_view mask. Optional until_log / until_generation_gt wait until any condition matches or wait_ms elapses."
     )]
-    fn observe(
+    async fn observe(
         &self,
-        Parameters(params): Parameters<InstanceParams>,
+        Parameters(params): Parameters<ObserveParams>,
     ) -> Result<CallToolResult, McpError> {
-        Self::tool_result(self.observe_json(params.instance_id.as_deref()))
+        Self::tool_result(
+            self.observe_wait_json(
+                params.instance_id.as_deref(),
+                params.wait_ms,
+                params.until_log.as_deref(),
+                params.until_generation_gt,
+            )
+            .await,
+        )
     }
 }
 
 #[tool_handler(
     name = "crosspoint-simulator-mcp-proxy",
     version = "0.1.0",
-    instructions = "Control and observe eBook firmware simulator instances over Session. A session appears when a simulator dials this process, or when start_instance launches the operator-configured --simulator binary. This server does not build firmware or accept a client-supplied binary path. Board and compile-time firmware options stay in the binary; Register reports them after connect. Tools that target a session require instance_id (1-64 bytes) unless --default-instance is set. Do not omit an id when only one simulator is connected. start_instance always requires an explicit instance_id and defaults to headless. sample_book (default true) seeds fs_/books/CrossPoint-Reader.epub from the committed README fixture; pass false for an empty library. Use list_instances and get_instance to see connected peers. inject_touch, inject_key, inject_home, and inject_swipe wait for InputAck unless wait is false. request_snapshot waits for a PNG SnapshotFrame. observe drains inbound events including human and remote InputObserved. InputAck means the inject was queued, not that the panel painted; after inject, observe for ACT/ERS/GFX logs or a framebufferGeneration bump. Do not sleep as synchronization. Tap (inject_touch) when Register.capTouch is true; default X4 has no touch and no Home. shutdown_instance sends ShutdownRequest and reaps a child this server started. Read csm://capabilities for the machine-readable surface. csm://instances lists connections; csm://instances/{id} is one snapshot."
+    instructions = "Control and observe eBook firmware simulator instances over Session. A session appears when a simulator dials this process, or when start_instance launches the operator-configured --simulator binary. This server does not build firmware or accept a client-supplied binary path. Board and compile-time firmware options stay in the binary; Register reports them after connect. Tools that target a session require instance_id (1-64 bytes) unless --default-instance is set. Do not omit an id when only one simulator is connected. start_instance always requires an explicit instance_id and defaults to headless. sample_book (default true) seeds fs_/books/CrossPoint-Reader.epub from the committed README fixture; pass false for an empty library. auto_sleep (default false, or --auto-sleep / CSM_AUTO_SLEEP) seeds fs_/.crosspoint/settings.json with sleepTimeoutMinutes 31 (never); pass true to keep firmware's 10-minute idle sleep. Use list_instances and get_instance to see connected peers. inject_touch, inject_key, inject_home, and inject_swipe wait for InputAck unless wait is false. request_snapshot waits for a PNG SnapshotFrame. observe drains inbound events including human and remote InputObserved. Pass until_log and/or until_generation_gt to wait; wait_ms overrides the process default (--observe-wait-ms / CSM_OBSERVE_WAIT_MS, 8000). InputAck means the inject was queued, not that the panel painted; after inject, observe for ACT/ERS/GFX logs or a framebufferGeneration bump. Do not sleep as synchronization. Tap (inject_touch) when Register.capTouch is true; default X4 has no touch and no Home. shutdown_instance sends ShutdownRequest and reaps a child this server started. Read csm://capabilities for the machine-readable surface. csm://instances lists connections; csm://instances/{id} is one snapshot."
 )]
 impl ServerHandler for McpServer {
     fn get_info(&self) -> ServerInfo {
@@ -971,7 +1119,7 @@ impl ServerHandler for McpServer {
     ) -> Result<ReadResourceResponse, McpError> {
         if request.uri == CAPABILITIES_URI {
             return Ok(ReadResourceResult::new(vec![ResourceContents::text(
-                Self::capabilities_json(self.spawn.configured()).to_string(),
+                self.capabilities_document().to_string(),
                 CAPABILITIES_URI,
             )])
             .into());
@@ -1065,8 +1213,8 @@ mod tests {
     use std::time::Duration;
 
     use csm_pb_bindings::generated::crosspoint::sim::control::v1alpha1::{
-        InputAck, InputObserved, InputSource, KeyEdge, Register, SimToServer, SnapshotError,
-        SnapshotFrame, server_to_sim,
+        Heartbeat, InputAck, InputObserved, InputSource, KeyEdge, LogLine, Register, SimToServer,
+        SnapshotError, SnapshotFrame, server_to_sim,
     };
     use tokio::sync::mpsc;
 
@@ -1255,6 +1403,108 @@ mod tests {
         let events = observed["events"].as_array().unwrap();
         assert_eq!(events.len(), 1);
         assert!(events[0].get("log").is_some());
+    }
+
+    #[tokio::test]
+    async fn observe_wait_matches_log_or_times_out() {
+        let map = InstanceMap::new();
+        let (_rx, sink) = insert(&map, "sim-a");
+        sink.push(SimToServer {
+            seq: 2,
+            payload: Some(
+                LogLine {
+                    text: "ACT Entering activity: Home".into(),
+                    ..Default::default()
+                }
+                .into(),
+            ),
+            ..Default::default()
+        });
+        let mcp = McpServer::new(map);
+        let hit = mcp
+            .observe_wait_json(
+                Some("sim-a"),
+                Some(50),
+                Some("Entering activity: Home"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(hit["matched"], true);
+        assert_eq!(hit["timedOut"], false);
+        assert_eq!(hit["events"].as_array().unwrap().len(), 1);
+
+        let miss = mcp
+            .observe_wait_json(Some("sim-a"), Some(40), Some("ERS Rendered page"), None)
+            .await
+            .unwrap();
+        assert_eq!(miss["matched"], false);
+        assert_eq!(miss["timedOut"], true);
+        assert!(miss["events"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn observe_wait_matches_generation_and_late_log() {
+        let map = InstanceMap::new();
+        let (tx, _rx) = mpsc::channel(8);
+        let (token, sink) = map.insert(register("sim-a"), 8, tx);
+        map.set_heartbeat(
+            "sim-a",
+            token,
+            Heartbeat {
+                framebuffer_generation: 4,
+                ..Default::default()
+            },
+        );
+        let mcp = McpServer::new(map.clone());
+        let generation = mcp
+            .observe_wait_json(Some("sim-a"), Some(50), None, Some(3))
+            .await
+            .unwrap();
+        assert_eq!(generation["matched"], true);
+        assert_eq!(generation["timedOut"], false);
+
+        let mcp_late = McpServer::new(map);
+        let waiter = tokio::spawn(async move {
+            mcp_late
+                .observe_wait_json(Some("sim-a"), Some(400), Some("ERS Rendered page"), None)
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        sink.push(SimToServer {
+            seq: 9,
+            payload: Some(
+                LogLine {
+                    text: "ERS Rendered page in 12ms".into(),
+                    ..Default::default()
+                }
+                .into(),
+            ),
+            ..Default::default()
+        });
+        let late = waiter.await.unwrap().unwrap();
+        assert_eq!(late["matched"], true);
+        assert_eq!(late["timedOut"], false);
+    }
+
+    #[tokio::test]
+    async fn observe_wait_without_until_is_a_one_shot_drain() {
+        let map = InstanceMap::new();
+        insert(&map, "sim-a");
+        let mcp = McpServer::new(map);
+        let observed = mcp
+            .observe_wait_json(Some("sim-a"), None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(observed["matched"], true);
+        assert_eq!(observed["timedOut"], false);
+        assert!(observed["events"].as_array().unwrap().is_empty());
+        let waited = mcp
+            .observe_wait_json(Some("sim-a"), Some(40), None, None)
+            .await
+            .unwrap();
+        assert_eq!(waited["matched"], true);
+        assert_eq!(waited["timedOut"], false);
     }
 
     #[tokio::test]
@@ -1561,6 +1811,8 @@ mod tests {
         let instructions = info.instructions.expect("instructions");
         assert!(instructions.contains("start_instance"));
         assert!(instructions.contains("sample_book"));
+        assert!(instructions.contains("auto_sleep"));
+        assert!(instructions.contains("until_log"));
         assert!(instructions.contains("framebufferGeneration"));
         assert!(instructions.contains("capTouch"));
         assert!(instructions.contains("csm://capabilities"));
@@ -1570,10 +1822,25 @@ mod tests {
         assert_eq!(caps["spawn"]["firmwareBuild"], false);
         assert_eq!(caps["spawn"]["clientPassesBinary"], false);
         assert_eq!(caps["spawn"]["sampleBookDefault"], true);
+        assert_eq!(caps["spawn"]["autoSleepDefault"], false);
+        assert_eq!(caps["spawn"]["autoSleep"]["neverMinutes"], 31);
+        assert_eq!(caps["observe"]["waitMsDefault"], 8000);
+        assert_eq!(caps["observe"]["untilLogParam"], "until_log");
         assert_eq!(
             caps["spawn"]["sampleBook"]["filename"],
             "CrossPoint-Reader.epub"
         );
+        let live = McpServer::with_spawn(
+            InstanceMap::new(),
+            SpawnConfig {
+                auto_sleep_default: true,
+                observe_wait_ms: 1500,
+                ..SpawnConfig::default()
+            },
+        )
+        .capabilities_document();
+        assert_eq!(live["spawn"]["autoSleepDefault"], true);
+        assert_eq!(live["observe"]["waitMsDefault"], 1500);
         let tools = caps["tools"].as_array().expect("tools");
         assert_eq!(tools.len(), TOOL_NAMES.len());
         for name in TOOL_NAMES {
@@ -1589,7 +1856,7 @@ mod tests {
     async fn start_instance_errors_when_spawn_is_unset_or_already_connected() {
         let mcp = McpServer::new(InstanceMap::new());
         assert_eq!(
-            mcp.start_instance_json("e2e-a", true, None, true)
+            mcp.start_instance_json("e2e-a", true, None, true, false)
                 .await
                 .unwrap_err(),
             "spawn is not configured; set --simulator / CSM_SIMULATOR"
@@ -1604,13 +1871,13 @@ mod tests {
             },
         );
         assert_eq!(
-            mcp.start_instance_json("sim-a", true, None, true)
+            mcp.start_instance_json("sim-a", true, None, true, false)
                 .await
                 .unwrap_err(),
             "instance is already connected"
         );
         assert_eq!(
-            mcp.start_instance_json("", true, None, true)
+            mcp.start_instance_json("", true, None, true, false)
                 .await
                 .unwrap_err(),
             "instance_id is required (1-64 bytes)"
@@ -1629,7 +1896,7 @@ mod tests {
             },
         );
         assert_eq!(
-            mcp.start_instance_json("no-reg", true, None, false)
+            mcp.start_instance_json("no-reg", true, None, false, false)
                 .await
                 .unwrap_err(),
             "timed out waiting for register"

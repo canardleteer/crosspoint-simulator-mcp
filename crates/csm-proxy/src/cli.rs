@@ -50,6 +50,16 @@ pub struct Args {
         allow_hyphen_values = true
     )]
     pub simulator_arg: Vec<String>,
+
+    /// Process default for `start_instance.auto_sleep` when the client omits it.
+    /// false (default) seeds never-sleep settings; true keeps firmware's 10-minute idle sleep.
+    #[arg(long, env = "CSM_AUTO_SLEEP", default_value_t = false)]
+    pub auto_sleep: bool,
+
+    /// Default `observe` timeout in milliseconds when `until_log` or
+    /// `until_generation_gt` is set and `wait_ms` is omitted.
+    #[arg(long, env = "CSM_OBSERVE_WAIT_MS", default_value_t = crate::spawn::DEFAULT_OBSERVE_WAIT_MS)]
+    pub observe_wait_ms: u32,
 }
 
 fn parse_instance_id(s: &str) -> Result<String, String> {
@@ -80,6 +90,8 @@ mod tests {
         assert!(args.default_instance.is_none());
         assert!(args.simulator.is_none());
         assert!(args.simulator_arg.is_empty());
+        assert!(!args.auto_sleep);
+        assert_eq!(args.observe_wait_ms, crate::spawn::DEFAULT_OBSERVE_WAIT_MS);
     }
 
     #[test]
@@ -107,8 +119,13 @@ mod tests {
             "/opt/sim",
             "--simulator-arg=--headless",
             "--simulator-arg=--foo",
+            "--auto-sleep",
+            "--observe-wait-ms",
+            "2500",
         ])
         .unwrap();
+        assert!(args.auto_sleep);
+        assert_eq!(args.observe_wait_ms, 2500);
         assert_eq!(args.listen, "127.0.0.1:0".parse().unwrap());
         assert_eq!(args.default_instance.as_deref(), Some("sim-a"));
         assert_eq!(
@@ -130,13 +147,11 @@ mod tests {
             Args::try_parse_from(["crosspoint-simulator-mcp-proxy", "--default-instance", ""])
                 .is_err()
         );
-        assert!(
-            Args::try_parse_from([
-                "crosspoint-simulator-mcp-proxy",
-                "--default-instance",
-                &"x".repeat(65)
-            ])
-            .is_err()
-        );
+        assert!(Args::try_parse_from([
+            "crosspoint-simulator-mcp-proxy",
+            "--default-instance",
+            &"x".repeat(65)
+        ])
+        .is_err());
     }
 }

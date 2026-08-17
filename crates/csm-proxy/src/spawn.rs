@@ -15,8 +15,17 @@ use crate::is_valid_instance_id;
 /// How long `start_instance` waits for `Register` by default.
 pub const SPAWN_WAIT: Duration = Duration::from_secs(15);
 
+/// Default `observe` timeout when an until-condition is set and `wait_ms` is omitted.
+pub const DEFAULT_OBSERVE_WAIT_MS: u32 = 8000;
+
+/// Firmware `sleepTimeoutMinutes` value that disables idle auto-sleep.
+pub const NEVER_SLEEP_TIMEOUT_MINUTES: u32 = 31;
+
 /// Filename written under `fs_/books/` when `sample_book` is true.
 pub const SAMPLE_BOOK_FILENAME: &str = "CrossPoint-Reader.epub";
+
+/// Host path of the firmware settings file under an instance working directory.
+pub const SETTINGS_RELATIVE: &str = "fs_/.crosspoint/settings.json";
 
 /// Committed EPUB 2 built from the CrossPoint Reader README.
 pub const SAMPLE_BOOK_EPUB: &[u8] = include_bytes!("../fixtures/crosspoint-reader.epub");
@@ -32,6 +41,10 @@ pub struct SpawnConfig {
     pub listen: SocketAddr,
     /// How long to wait for the instance to register.
     pub wait: Duration,
+    /// Process default for `start_instance.auto_sleep` when the client omits it.
+    pub auto_sleep_default: bool,
+    /// Process default for `observe.wait_ms` when an until-condition is set.
+    pub observe_wait_ms: u32,
 }
 
 impl Default for SpawnConfig {
@@ -41,6 +54,8 @@ impl Default for SpawnConfig {
             extra_args: Vec::new(),
             listen: SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 50051)),
             wait: SPAWN_WAIT,
+            auto_sleep_default: false,
+            observe_wait_ms: DEFAULT_OBSERVE_WAIT_MS,
         }
     }
 }
@@ -53,6 +68,8 @@ impl SpawnConfig {
             extra_args: args.simulator_arg.clone(),
             listen: args.listen,
             wait: SPAWN_WAIT,
+            auto_sleep_default: args.auto_sleep,
+            observe_wait_ms: args.observe_wait_ms,
         }
     }
 
@@ -136,6 +153,16 @@ pub fn seed_sample_book(cwd: &Path) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+/// Write never-sleep firmware settings to `{cwd}/fs_/.crosspoint/settings.json`.
+pub fn seed_never_sleep_settings(cwd: &Path) -> Result<PathBuf, String> {
+    let dir = cwd.join("fs_").join(".crosspoint");
+    std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+    let path = dir.join("settings.json");
+    let body = format!("{{\"sleepTimeoutMinutes\":{NEVER_SLEEP_TIMEOUT_MINUTES}}}\n");
+    std::fs::write(&path, body).map_err(|err| err.to_string())?;
+    Ok(path)
+}
+
 fn safe_dir_name(id: &str) -> String {
     if !id.is_empty()
         && id
@@ -180,6 +207,16 @@ impl SpawnSupervisor {
         self.config.wait
     }
 
+    /// Process default for `start_instance.auto_sleep` when the client omits it.
+    pub fn auto_sleep_default(&self) -> bool {
+        self.config.auto_sleep_default
+    }
+
+    /// Process default for `observe` until-condition timeouts.
+    pub fn observe_wait_ms(&self) -> u32 {
+        self.config.observe_wait_ms
+    }
+
     /// True when this process started `instance_id` and the child is still up.
     pub fn is_alive(&self, instance_id: &str) -> bool {
         let mut inner = self.inner.lock().expect("spawn lock");
@@ -194,6 +231,7 @@ impl SpawnSupervisor {
         cwd: Option<&Path>,
         already_connected: bool,
         sample_book: bool,
+        auto_sleep: bool,
     ) -> Result<u32, SpawnError> {
         if !is_valid_instance_id(instance_id) {
             tracing::warn!(instance_id, "spawn rejected: invalid instance_id");
@@ -236,6 +274,21 @@ impl SpawnSupervisor {
                 Err(err) => {
                     self.clear_starting(instance_id);
                     tracing::warn!(instance_id, error = %err, "sample book seed failed");
+                    return Err(SpawnError::SpawnFailed(err));
+                }
+            }
+        }
+        if !auto_sleep {
+            match seed_never_sleep_settings(&workdir) {
+                Ok(path) => tracing::info!(
+                    instance_id,
+                    path = %path.display(),
+                    minutes = NEVER_SLEEP_TIMEOUT_MINUTES,
+                    "seeded never-sleep settings"
+                ),
+                Err(err) => {
+                    self.clear_starting(instance_id);
+                    tracing::warn!(instance_id, error = %err, "never-sleep settings seed failed");
                     return Err(SpawnError::SpawnFailed(err));
                 }
             }
@@ -391,6 +444,8 @@ mod tests {
         assert_eq!(cfg.extra_args, vec!["--foo".to_string()]);
         assert_eq!(cfg.listen, "127.0.0.1:9".parse().unwrap());
         assert!(cfg.is_configured());
+        assert!(!cfg.auto_sleep_default);
+        assert_eq!(cfg.observe_wait_ms, DEFAULT_OBSERVE_WAIT_MS);
         assert!(!SpawnConfig::default().is_configured());
     }
 
@@ -399,7 +454,7 @@ mod tests {
         let supervisor = SpawnSupervisor::new(SpawnConfig::default());
         assert_eq!(
             supervisor
-                .start("ok", true, None, false, false)
+                .start("ok", true, None, false, false, false)
                 .await
                 .unwrap_err(),
             SpawnError::NotConfigured
@@ -410,14 +465,14 @@ mod tests {
         });
         assert_eq!(
             supervisor
-                .start("", true, None, false, false)
+                .start("", true, None, false, false, false)
                 .await
                 .unwrap_err(),
             SpawnError::InvalidId
         );
         assert_eq!(
             supervisor
-                .start("ok", true, None, true, false)
+                .start("ok", true, None, true, false, false)
                 .await
                 .unwrap_err(),
             SpawnError::AlreadyConnected
@@ -433,14 +488,14 @@ mod tests {
             ..SpawnConfig::default()
         });
         let pid = supervisor
-            .start("sleepy", true, None, false, false)
+            .start("sleepy", true, None, false, false, false)
             .await
             .expect("sleep starts");
         assert!(pid > 0);
         assert!(supervisor.is_alive("sleepy"));
         assert_eq!(
             supervisor
-                .start("sleepy", true, None, false, false)
+                .start("sleepy", true, None, false, false, false)
                 .await
                 .unwrap_err(),
             SpawnError::AlreadySpawned
@@ -462,6 +517,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn seed_never_sleep_settings_writes_firmware_json() {
+        let dir = std::env::temp_dir().join(format!("csm-never-sleep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = seed_never_sleep_settings(&dir).expect("seed");
+        assert_eq!(path, dir.join(SETTINGS_RELATIVE));
+        let body = std::fs::read_to_string(&path).expect("read");
+        assert!(body.contains(&format!(
+            "\"sleepTimeoutMinutes\":{NEVER_SLEEP_TIMEOUT_MINUTES}"
+        )));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn start_seeds_sample_book_only_when_requested() {
         let with_book = std::env::temp_dir().join(format!("csm-seed-yes-{}", std::process::id()));
@@ -474,11 +542,11 @@ mod tests {
             ..SpawnConfig::default()
         });
         supervisor
-            .start("seed-yes", true, Some(&with_book), false, true)
+            .start("seed-yes", true, Some(&with_book), false, true, false)
             .await
             .expect("start with book");
         supervisor
-            .start("seed-no", true, Some(&without), false, false)
+            .start("seed-no", true, Some(&without), false, false, true)
             .await
             .expect("start without book");
         assert!(
@@ -495,6 +563,8 @@ mod tests {
                 .join(SAMPLE_BOOK_FILENAME)
                 .is_file()
         );
+        assert!(with_book.join(SETTINGS_RELATIVE).is_file());
+        assert!(!without.join(SETTINGS_RELATIVE).is_file());
         supervisor.reap("seed-yes").await;
         supervisor.reap("seed-no").await;
         let _ = std::fs::remove_dir_all(&with_book);

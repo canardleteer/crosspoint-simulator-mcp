@@ -17,11 +17,15 @@ lines. `--mcp-http` selects Streamable HTTP at `/mcp` instead of stdio.
 Inject tools and `request_snapshot` wait on the session by default
 (`InputAck`, or `SnapshotFrame` / `SnapshotError` as MCP image content).
 Pass `wait: false` to enqueue only. `observe` honors the last
-`SetSessionView` mask (SimToServer payload names). Tools that target a
+`SetSessionView` mask (SimToServer payload names). It can wait with
+`until_log` and/or `until_generation_gt` until any condition matches
+or `wait_ms` elapses. Tools that target a
 session still require an instance id unless `--default-instance` is set.
 `start_instance` defaults to copying the committed sample EPUB
 (`CrossPoint-Reader.epub`, from the CrossPoint Reader README) into
 `fs_/books/`. Pass `sample_book: false` for an empty library.
+`auto_sleep` defaults to false and seeds never-sleep firmware settings
+(`sleepTimeoutMinutes` 31); pass true to keep the 10-minute idle sleep.
 
 | Flag | Env | Role |
 | --- | --- | --- |
@@ -30,6 +34,8 @@ session still require an instance id unless `--default-instance` is set.
 | `--default-instance` | `CSM_DEFAULT_INSTANCE` | Explicit instance id (1–64 bytes) a tool may use when it does not pass one |
 | `--simulator` | `CSM_SIMULATOR` | Prebuilt simulator binary executed only by `start_instance` |
 | `--simulator-arg` | `CSM_SIMULATOR_ARGS` | Extra argv for `start_instance` (repeatable; env is comma-separated) |
+| `--auto-sleep` | `CSM_AUTO_SLEEP` | Process default for `start_instance.auto_sleep` (default false = never-sleep settings) |
+| `--observe-wait-ms` | `CSM_OBSERVE_WAIT_MS` | Default `observe` timeout when an until-condition is set and `wait_ms` is omitted (default 8000) |
 | | `RUST_LOG` | `tracing` filter (default `csm_proxy=info` when unset) |
 
 ```bash
