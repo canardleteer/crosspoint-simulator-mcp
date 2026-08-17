@@ -9,6 +9,8 @@ tags:
 links:
 - target: 1
   kind: relatesto
+- target: 6
+  kind: relatesto
 ---
 
 # 5. Accept inbound simulator connections and do not preclude spawning

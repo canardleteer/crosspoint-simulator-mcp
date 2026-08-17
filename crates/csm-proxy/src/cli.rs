@@ -1,4 +1,4 @@
-//! Clap flags for listen, instance selection, and later spawn hints.
+//! Clap flags for listen, instance selection, and spawn.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -9,9 +9,8 @@ use crate::InstanceMap;
 
 /// MCP proxy that accepts inbound eBook firmware simulator Session streams.
 ///
-/// A session appears when a simulator dials this process. `--simulator` and
-/// `--simulator-arg` are reserved for a later spawn path and are not
-/// executed.
+/// A session appears when a simulator dials this process, or when
+/// `start_instance` executes `--simulator`.
 #[derive(Parser, Debug, Clone, PartialEq, Eq)]
 #[command(name = "crosspoint-simulator-mcp-proxy", version, about)]
 pub struct Args {
@@ -35,12 +34,13 @@ pub struct Args {
     #[arg(long, env = "CSM_DEFAULT_INSTANCE", value_parser = parse_instance_id)]
     pub default_instance: Option<String>,
 
-    /// Path of a known simulator binary for a later spawn. Not executed.
+    /// Path of a known prebuilt simulator binary. Executed only by
+    /// `start_instance`.
     #[arg(long, env = "CSM_SIMULATOR")]
     pub simulator: Option<PathBuf>,
 
-    /// Extra argv for a later spawn. Repeatable. Not executed.
-    /// `CSM_SIMULATOR_ARGS` is a comma-separated list.
+    /// Extra argv appended before Session flags when `start_instance` runs.
+    /// Repeatable. `CSM_SIMULATOR_ARGS` is a comma-separated list.
     #[arg(
         long = "simulator-arg",
         env = "CSM_SIMULATOR_ARGS",
@@ -60,7 +60,7 @@ fn parse_instance_id(s: &str) -> Result<String, String> {
 }
 
 impl Args {
-    /// Apply the default-instance hint. Does not spawn `--simulator`.
+    /// Apply the default-instance hint. Does not start `--simulator`.
     pub fn apply_instance_hints(&self, instances: &InstanceMap) {
         instances.set_default_instance(self.default_instance.clone());
     }
@@ -95,7 +95,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_listen_default_and_unused_simulator_hints() {
+    fn parses_listen_default_and_simulator_hints() {
         let args = Args::try_parse_from([
             "crosspoint-simulator-mcp-proxy",
             "--listen",

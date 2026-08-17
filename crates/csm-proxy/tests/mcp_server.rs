@@ -5,7 +5,9 @@ use std::time::Duration;
 use csm_pb_bindings::generated::crosspoint::sim::control::v1alpha1::{
     InputAck, Register, SimToServer, SnapshotFrame,
 };
-use csm_proxy::{InstanceMap, McpServer, serve_mcp_http_listener};
+use csm_proxy::{
+    CAPABILITIES_URI, INSTRUCTIONS, InstanceMap, McpServer, TOOL_NAMES, serve_mcp_http_listener,
+};
 use rmcp::ServiceExt;
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, ClientInfo, ContentBlock, ReadResourceRequestParams,
@@ -65,10 +67,16 @@ async fn stdio_lists_tools_and_instances() {
     let (tx, _rx) = mpsc::channel(4);
     instances.insert(register("sim-a"), 4, tx);
     let client = connect_duplex(instances).await;
+    let info = client.peer_info().expect("peer info");
+    assert_eq!(info.instructions.as_deref(), Some(INSTRUCTIONS));
     let tools = client.list_tools(None).await.expect("list tools");
     let names: Vec<_> = tools.tools.iter().map(|tool| tool.name.as_ref()).collect();
     assert!(names.contains(&"list_instances"));
     assert!(names.contains(&"observe"));
+    assert!(names.contains(&"start_instance"));
+    for name in TOOL_NAMES {
+        assert!(names.contains(name), "{name}");
+    }
     let listed = client
         .call_tool(CallToolRequestParams::new("list_instances"))
         .await
@@ -183,6 +191,7 @@ async fn streamable_http_calls_a_tool() {
         .iter()
         .map(|resource| resource.uri.as_str())
         .collect();
+    assert!(uris.contains(&CAPABILITIES_URI));
     assert!(uris.contains(&"csm://instances"));
     assert!(uris.contains(&"csm://instances/sim-http"));
     let read = client
@@ -195,6 +204,18 @@ async fn streamable_http_calls_a_tool() {
             assert_eq!(body["instances"][0]["instanceId"], "sim-http");
         }
         other => panic!("unexpected resource: {other:?}"),
+    }
+    let caps = client
+        .read_resource(ReadResourceRequestParams::new(CAPABILITIES_URI))
+        .await
+        .expect("read capabilities");
+    match caps.contents.first() {
+        Some(rmcp::model::ResourceContents::TextResourceContents { text, .. }) => {
+            let body: Value = serde_json::from_str(text).expect("capabilities json");
+            assert_eq!(body["spawn"]["configured"], false);
+            assert_eq!(body["spawn"]["tool"], "start_instance");
+        }
+        other => panic!("unexpected capabilities: {other:?}"),
     }
     client.cancel().await.expect("cancel client");
 }
@@ -260,6 +281,7 @@ async fn streamable_http_catalog_enqueues_and_reads_resources() {
         ),
         ("shutdown_instance", id.clone()),
         ("observe", id.clone()),
+        ("start_instance", json!({ "instance_id": "spawn-me" })),
         ("get_instance", json!({ "instance_id": "" })),
         ("get_instance", json!({ "instance_id": "missing" })),
     ] {

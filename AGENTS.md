@@ -10,18 +10,25 @@ work in this repository.
 
 An MCP server that lets a host application control and observe an eBook
 firmware simulator (with UI), and observe a person using that simulator.
-The simulator is not an MCP peer. The first integration path is an
-already-running simulator that dials in; spawning a known simulator
-remains allowed and is not implemented yet.
+The simulator is not an MCP peer. A session appears when a simulator
+dials in, or when `start_instance` executes the operator-configured
+`--simulator` / `CSM_SIMULATOR` binary. The MCP client does not pass a
+binary path, free-form argv, or firmware compile options. Board and
+other compile-time firmware flags stay in the binary; `Register`
+reports them after connect. `--simulator-arg` / `CSM_SIMULATOR_ARGS`
+are extra argv this server appends before Session flags it controls
+(`--sim-grpc`, `--sim-grpc-addr` from `--listen`, `--sim-instance-id`,
+and `--sim-headless` when requested). `start_instance` requires an
+explicit instance id (1–64 bytes) and defaults to headless. This
+process does not auto-start a simulator on boot.
 
 Instance ids are required and cannot be empty: `Register.instance_id`
 and every later selector must be 1–64 bytes. Do not omit an id when
 exactly one simulator is connected, and do not infer a target from
 connection count. MCP tools that target a session name an id, or use
 the process default from `--default-instance` / `CSM_DEFAULT_INSTANCE`
-when that flag is a valid id. Inbound `Session` is how a simulator
-appears today. `--simulator` and `--simulator-arg` are reserved spawn
-hints and must not start a process.
+when that flag is a valid id. Clients discover the surface from
+initialize instructions, `tools/list`, and `csm://capabilities`.
 
 This process is the MCP peer (`rmcp`). Default MCP transport is stdio
 (JSON-RPC only on stdout; logs go to stderr). `--mcp-http` /

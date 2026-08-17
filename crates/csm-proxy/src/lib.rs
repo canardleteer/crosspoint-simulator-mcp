@@ -4,6 +4,7 @@ pub mod cli;
 pub mod instances;
 pub mod mcp;
 pub mod session;
+pub mod spawn;
 
 use std::net::SocketAddr;
 
@@ -14,8 +15,12 @@ pub use instances::{
     INSTANCE_ID_MAX_LEN, InstanceMap, InstanceSnapshot, QUEUE_CAPACITY, REPLY_TIMEOUT,
     ResolveError, TrySendError, WaitError, is_valid_instance_id,
 };
-pub use mcp::{McpServer, serve_mcp_http, serve_mcp_http_listener, serve_mcp_stdio};
+pub use mcp::{
+    CAPABILITIES_URI, INSTRUCTIONS, McpServer, TOOL_NAMES, serve_mcp_http, serve_mcp_http_listener,
+    serve_mcp_stdio,
+};
 pub use session::SessionService;
+pub use spawn::{SPAWN_WAIT, SpawnConfig, SpawnError, SpawnSupervisor, default_cwd, spawn_argv};
 
 /// Bind and serve inbound `Session` on `addr` until the process exits.
 pub async fn serve(
@@ -30,18 +35,19 @@ pub async fn serve(
 pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let instances = InstanceMap::new();
     args.apply_instance_hints(&instances);
+    let spawn = SpawnConfig::from_args(&args);
     let session = serve(args.listen, instances.clone());
     match args.mcp_http {
         Some(mcp_addr) => {
             tokio::select! {
                 result = session => result,
-                result = serve_mcp_http(mcp_addr, instances) => result,
+                result = serve_mcp_http(mcp_addr, instances, spawn) => result,
             }
         }
         None => {
             tokio::select! {
                 result = session => result,
-                result = serve_mcp_stdio(instances) => result,
+                result = serve_mcp_stdio(instances, spawn) => result,
             }
         }
     }

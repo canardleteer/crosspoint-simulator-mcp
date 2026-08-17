@@ -3,7 +3,10 @@
 `crosspoint-simulator-mcp-proxy` is an MCP server. A host attaches over
 stdio (default) or Streamable HTTP. The same process listens for inbound
 simulator `Session` streams over gRPC (plaintext). A session appears when
-a simulator dials in. Default Session address is `127.0.0.1:50051`.
+a simulator dials in, or when `start_instance` launches `--simulator`.
+Default Session address is `127.0.0.1:50051`. Clients discover tools and
+spawn limits from initialize instructions, `tools/list`, and
+`csm://capabilities`.
 
 On stdio, stdout is JSON-RPC only. Use stderr for logs. `--mcp-http`
 selects Streamable HTTP at `/mcp` instead of stdio.
@@ -19,8 +22,8 @@ session still require an instance id unless `--default-instance` is set.
 | `--listen` | `CSM_LISTEN` | gRPC Session listen address (default `127.0.0.1:50051`) |
 | `--mcp-http` | `CSM_MCP_HTTP` | Streamable HTTP MCP listen address (default `127.0.0.1:8765` when the flag is present with no value) |
 | `--default-instance` | `CSM_DEFAULT_INSTANCE` | Explicit instance id (1–64 bytes) a tool may use when it does not pass one |
-| `--simulator` | `CSM_SIMULATOR` | Path of a known simulator for a later spawn (not executed) |
-| `--simulator-arg` | `CSM_SIMULATOR_ARGS` | Extra argv for that later spawn (repeatable; env is comma-separated; not executed) |
+| `--simulator` | `CSM_SIMULATOR` | Prebuilt simulator binary executed only by `start_instance` |
+| `--simulator-arg` | `CSM_SIMULATOR_ARGS` | Extra argv for `start_instance` (repeatable; env is comma-separated) |
 
 ```bash
 # Host-launched MCP (stdio) plus Session listener

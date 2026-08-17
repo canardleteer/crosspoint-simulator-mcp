@@ -14,6 +14,7 @@ Modes
   (default)       Two instances, then missing-simulator and missing-server
   --human         Prompt for real key/click in the SDL window, then observe HUMAN
   --headless      One instance with --sim-headless; heartbeat, inject, snapshot
+  --spawn         Proxy starts the simulator via start_instance (needs --simulator)
   --show-windows  Open real SDL windows during automated mode
   --keep          Leave proxy/simulator processes running on exit
 """
@@ -105,6 +106,22 @@ class Mcp:
             if "result" in payload or "error" in payload:
                 return payload
         raise Fail(f"{name}: no JSON-RPC result ({payloads!r})")
+
+    def read_resource(self, uri: str, timeout: float = 10.0) -> dict[str, Any]:
+        self.n += 1
+        payloads = self._post(
+            {
+                "jsonrpc": "2.0",
+                "id": self.n + 10,
+                "method": "resources/read",
+                "params": {"uri": uri},
+            },
+            timeout=timeout,
+        )
+        for payload in payloads:
+            if "result" in payload or "error" in payload:
+                return payload
+        raise Fail(f"resources/read {uri}: no JSON-RPC result ({payloads!r})")
 
 
 def tool_error(resp: dict[str, Any]) -> bool:
@@ -207,16 +224,19 @@ class Harness:
         return proc
 
     def start_proxy(self) -> Proc:
-        proc = self.spawn(
-            "proxy",
-            [
-                str(self.proxy_bin),
-                "--listen",
-                self.listen,
-                "--mcp-http",
-                self.mcp_http,
-            ],
-        )
+        extra_env: dict[str, str] = {}
+        if self.args.spawn and not self.args.show_windows:
+            extra_env["SDL_VIDEODRIVER"] = "dummy"
+        argv = [
+            str(self.proxy_bin),
+            "--listen",
+            self.listen,
+            "--mcp-http",
+            self.mcp_http,
+        ]
+        if self.args.spawn:
+            argv.extend(["--simulator", str(self.sim_bin)])
+        proc = self.spawn("proxy", argv, extra_env=extra_env or None)
         self.proxy = proc
         self.mcp = Mcp(self.mcp_url)
         return proc
@@ -245,6 +265,22 @@ class Harness:
         if self.mcp is None:
             raise Fail("MCP client is not connected")
         return self.mcp.call(name, args, timeout=timeout)
+
+    def read_resource(self, uri: str) -> Any:
+        if self.mcp is None:
+            raise Fail("MCP client is not connected")
+        resp = self.mcp.read_resource(uri)
+        if "error" in resp:
+            raise Fail(f"resources/read {uri}: {json.dumps(resp['error'])}")
+        contents = (resp.get("result") or {}).get("contents") or []
+        for block in contents:
+            text = block.get("text")
+            if text:
+                try:
+                    return json.loads(text)
+                except json.JSONDecodeError:
+                    return text
+        raise Fail(f"resources/read {uri}: no text ({resp!r})")
 
     def wait_instances(self, expected: set[str], timeout: float = 15.0) -> list[dict[str, Any]]:
         deadline = time.time() + timeout
@@ -399,6 +435,51 @@ def run_automated(harness: Harness) -> None:
     print("ok simulator redials after the server returns")
 
 
+def run_spawn(harness: Harness) -> None:
+    harness.start_proxy()
+    caps = harness.read_resource("csm://capabilities")
+    require(caps.get("spawn", {}).get("configured") is True, f"spawn not configured: {caps}")
+    require(caps.get("spawn", {}).get("tool") == "start_instance", f"spawn tool: {caps}")
+    print("ok csm://capabilities reports spawn configured")
+
+    started = harness.call(
+        "start_instance",
+        {"instance_id": "e2e-spawn", "headless": True},
+        timeout=20.0,
+    )
+    require(not tool_error(started), f"start_instance failed: {tool_text(started)}")
+    body = tool_json(started)
+    require(body.get("instanceId") == "e2e-spawn", f"start id: {body}")
+    require(int(body.get("pid") or 0) > 0, f"start pid: {body}")
+    print("ok start_instance registered e2e-spawn")
+
+    harness.drain_observe("e2e-spawn")
+    injected = harness.call(
+        "inject_key",
+        {"instance_id": "e2e-spawn", "name": "ENTER", "hold_ms": 80},
+    )
+    require(not tool_error(injected), f"inject_key failed: {tool_text(injected)}")
+    require(tool_json(injected).get("accepted") is True, f"inject not accepted: {tool_json(injected)}")
+    events = harness.wait_remote_key("e2e-spawn", "ENTER")
+    require(
+        "INPUT_SOURCE_HUMAN" not in [
+            (event.get("inputObserved") or {}).get("source")
+            for event in events
+            if event.get("inputObserved")
+        ],
+        f"spawn observe saw HUMAN: {events}",
+    )
+    print("ok inject ENTER is remote")
+
+    snap = harness.call("request_snapshot", {"instance_id": "e2e-spawn"})
+    require(not tool_error(snap), f"snapshot failed: {tool_text(snap)}")
+    snap_body = tool_json(snap)
+    require(snap_body.get("instanceId") == "e2e-spawn", f"snapshot id: {snap_body}")
+    require(snap_body.get("mimeType") == "image/png", f"snapshot mime: {snap_body}")
+    require(int(snap_body.get("width") or 0) > 0, f"snapshot width: {snap_body}")
+    print("ok snapshot PNG")
+
+
 def run_headless(harness: Harness) -> None:
     harness.start_proxy()
     sim = harness.start_sim("e2e-headless", headless=True)
@@ -489,6 +570,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="one instance with --sim-headless; require heartbeat, inject, snapshot",
     )
     parser.add_argument(
+        "--spawn",
+        action="store_true",
+        help="proxy start_instance of SIMULATOR_BIN; require inject and snapshot",
+    )
+    parser.add_argument(
         "--keep",
         action="store_true",
         help="leave proxy and simulator processes running",
@@ -513,12 +599,14 @@ def main(argv: list[str]) -> int:
         print(f"FAIL: {err}", file=sys.stderr)
         return 2
     try:
-        if args.human and args.headless:
-            raise Fail("--human and --headless cannot be combined")
+        if sum(bool(flag) for flag in (args.human, args.headless, args.spawn)) > 1:
+            raise Fail("--human, --headless, and --spawn cannot be combined")
         if args.human:
             run_human(harness)
         elif args.headless:
             run_headless(harness)
+        elif args.spawn:
+            run_spawn(harness)
         else:
             run_automated(harness)
         print("PASS")

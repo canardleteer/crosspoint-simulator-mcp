@@ -1,6 +1,8 @@
 //! MCP peer: tools and resources over [`InstanceMap`].
 
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::Router;
 use base64::Engine;
@@ -31,25 +33,99 @@ use tokio::net::TcpListener;
 use crate::instances::{
     InstanceMap, InstanceSnapshot, REPLY_TIMEOUT, ResolveError, TrySendError, WaitError,
 };
+use crate::spawn::{SpawnConfig, SpawnError, SpawnSupervisor};
 
 const INSTANCES_URI: &str = "csm://instances";
 const INSTANCE_URI_PREFIX: &str = "csm://instances/";
+/// Machine-readable MCP surface for clients that read resources.
+pub const CAPABILITIES_URI: &str = "csm://capabilities";
+
+/// Initialize instructions. Clients that only read this text can operate.
+pub const INSTRUCTIONS: &str = "Control and observe eBook firmware simulator instances over Session. \
+A session appears when a simulator dials this process, or when start_instance launches the \
+operator-configured --simulator binary. This server does not build firmware or accept a \
+client-supplied binary path. Board and compile-time firmware options stay in the binary; \
+Register reports them after connect. Tools that target a session require instance_id \
+(1-64 bytes) unless --default-instance is set. Do not omit an id when only one simulator \
+is connected. start_instance always requires an explicit instance_id and defaults to \
+headless. Use list_instances and get_instance to see connected peers. inject_touch, \
+inject_key, inject_home, and inject_swipe wait for InputAck unless wait is false. \
+request_snapshot waits for a PNG SnapshotFrame. observe drains inbound events including \
+human and remote InputObserved. shutdown_instance sends ShutdownRequest and reaps a child \
+this server started. Read csm://capabilities for the machine-readable surface. \
+csm://instances lists connections; csm://instances/{id} is one snapshot.";
+
+/// Tool names advertised in `csm://capabilities` and `tools/list`.
+pub const TOOL_NAMES: &[&str] = &[
+    "list_instances",
+    "get_instance",
+    "start_instance",
+    "inject_touch",
+    "inject_key",
+    "inject_home",
+    "inject_swipe",
+    "set_inject_enabled",
+    "request_snapshot",
+    "set_session_view",
+    "shutdown_instance",
+    "observe",
+];
 
 /// MCP handler shared by stdio and Streamable HTTP.
 #[derive(Clone)]
 pub struct McpServer {
     instances: InstanceMap,
+    spawn: Arc<SpawnSupervisor>,
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
 
 impl McpServer {
-    /// Serve tools and resources against `instances`.
+    /// Serve tools and resources against `instances` with spawn disabled.
     pub fn new(instances: InstanceMap) -> Self {
+        Self::with_spawn(instances, SpawnConfig::default())
+    }
+
+    /// Serve tools and resources; `start_instance` uses `spawn` when configured.
+    pub fn with_spawn(instances: InstanceMap, spawn: SpawnConfig) -> Self {
         Self {
             instances,
+            spawn: Arc::new(SpawnSupervisor::new(spawn)),
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Reap children started by `start_instance`.
+    pub async fn reap_spawned(&self) {
+        self.spawn.reap_all().await;
+    }
+
+    /// Machine-readable surface. `spawn_configured` is whether `--simulator` is set.
+    pub fn capabilities_json(spawn_configured: bool) -> Value {
+        json!({
+            "tools": TOOL_NAMES,
+            "resources": [CAPABILITIES_URI, INSTANCES_URI, "csm://instances/{id}"],
+            "instanceId": {
+                "required": true,
+                "minBytes": 1,
+                "maxBytes": 64,
+                "omitWhenOne": false,
+                "startInstanceRequiresExplicitId": true,
+            },
+            "keys": ["BACK", "ENTER", "LEFT", "RIGHT", "UP", "DOWN", "POWER", "SLEEP", "QUIT"],
+            "snapshot": { "mimeType": "image/png", "format": 0 },
+            "spawn": {
+                "configured": spawn_configured,
+                "tool": "start_instance",
+                "headlessDefault": true,
+                "clientPassesBinary": false,
+                "firmwareBuild": false,
+            },
+            "firmware": {
+                "compileTime": true,
+                "see": "Register",
+            },
+        })
     }
 
     fn resolve(&self, instance_id: Option<&str>) -> Result<InstanceSnapshot, String> {
@@ -398,6 +474,57 @@ impl McpServer {
         self.enqueue(instance_id, false, ShutdownRequest::default())
     }
 
+    /// Start the configured binary and wait for `Register`.
+    pub async fn start_instance_json(
+        &self,
+        instance_id: &str,
+        headless: bool,
+        cwd: Option<&str>,
+    ) -> Result<Value, String> {
+        if !crate::is_valid_instance_id(instance_id) {
+            return Err(SpawnError::InvalidId.as_str());
+        }
+        let connected = self.instances.get(instance_id).is_some();
+        let cwd_path = cwd.map(PathBuf::from);
+        let pid = self
+            .spawn
+            .start(instance_id, headless, cwd_path.as_deref(), connected)
+            .await
+            .map_err(|err| err.as_str())?;
+        let deadline = Instant::now() + self.spawn.wait();
+        loop {
+            if let Some(snap) = self.instances.get(instance_id) {
+                return Ok(json!({
+                    "instanceId": snap.register.instance_id,
+                    "pid": pid,
+                    "register": snap.register,
+                    "lastHeartbeat": snap.last_heartbeat,
+                }));
+            }
+            if !self.spawn.is_alive(instance_id) {
+                self.spawn.reap(instance_id).await;
+                return Err(SpawnError::ExitedBeforeRegister.as_str());
+            }
+            if Instant::now() >= deadline {
+                self.spawn.reap(instance_id).await;
+                return Err(SpawnError::RegisterTimeout.as_str());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    async fn reap_if_spawned(&self, instance_id: Option<&str>) {
+        let id = match instance_id {
+            Some(id) if crate::is_valid_instance_id(id) => id.to_string(),
+            Some(_) => return,
+            None => match self.instances.default_instance() {
+                Some(id) => id,
+                None => return,
+            },
+        };
+        self.spawn.reap(&id).await;
+    }
+
     fn tool_result(result: Result<Value, String>) -> Result<CallToolResult, McpError> {
         match result {
             Ok(value) => Ok(CallToolResult::success(vec![ContentBlock::text(
@@ -428,6 +555,10 @@ impl McpServer {
 }
 
 fn default_wait() -> bool {
+    true
+}
+
+fn default_headless() -> bool {
     true
 }
 
@@ -550,14 +681,30 @@ struct SessionViewParams {
     paths: Vec<String>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct StartInstanceParams {
+    /// Instance id (1–64 bytes). Required. Not taken from `--default-instance`.
+    instance_id: String,
+    /// When true (default), pass `--sim-headless`.
+    #[serde(default = "default_headless")]
+    headless: bool,
+    /// Working directory. When omitted, a per-instance directory under `$TMPDIR`.
+    #[serde(default)]
+    cwd: Option<String>,
+}
+
 #[tool_router]
 impl McpServer {
-    #[tool(description = "List connected simulator instances")]
+    #[tool(
+        description = "List connected simulator instances (instanceId, register, lastHeartbeat). A session appears after inbound dial or start_instance."
+    )]
     fn list_instances(&self) -> Result<CallToolResult, McpError> {
         Self::tool_result(Ok(self.list_instances_json()))
     }
 
-    #[tool(description = "Get one connected simulator instance")]
+    #[tool(
+        description = "Get one connected instance by instance_id (1-64 bytes, or --default-instance). Returns register and lastHeartbeat."
+    )]
     fn get_instance(
         &self,
         Parameters(params): Parameters<InstanceParams>,
@@ -565,7 +712,22 @@ impl McpServer {
         Self::tool_result(self.get_instance_json(params.instance_id.as_deref()))
     }
 
-    #[tool(description = "Inject a touch edge or tap on the named instance")]
+    #[tool(
+        description = "Start the operator-configured --simulator binary and wait for Register. Requires an explicit instance_id. Defaults to headless. Fails if spawn is not configured, the id is already connected, or Register times out. Does not build firmware."
+    )]
+    async fn start_instance(
+        &self,
+        Parameters(params): Parameters<StartInstanceParams>,
+    ) -> Result<CallToolResult, McpError> {
+        Self::tool_result(
+            self.start_instance_json(&params.instance_id, params.headless, params.cwd.as_deref())
+                .await,
+        )
+    }
+
+    #[tool(
+        description = "Inject a touch edge or tap on the named instance; waits for InputAck unless wait is false"
+    )]
     async fn inject_touch(
         &self,
         Parameters(params): Parameters<InjectTouchParams>,
@@ -582,7 +744,9 @@ impl McpServer {
         )
     }
 
-    #[tool(description = "Inject a named device key on the named instance")]
+    #[tool(
+        description = "Inject a named device key (BACK, ENTER, LEFT, RIGHT, UP, DOWN, POWER, SLEEP, QUIT) on the named instance; waits for InputAck unless wait is false"
+    )]
     async fn inject_key(
         &self,
         Parameters(params): Parameters<InjectKeyParams>,
@@ -598,7 +762,9 @@ impl McpServer {
         )
     }
 
-    #[tool(description = "Inject the Home key on the named instance")]
+    #[tool(
+        description = "Inject the Home key on the named instance; waits for InputAck unless wait is false. Rejected when the board has no Home key."
+    )]
     async fn inject_home(
         &self,
         Parameters(params): Parameters<InjectHomeParams>,
@@ -609,7 +775,9 @@ impl McpServer {
         )
     }
 
-    #[tool(description = "Inject a swipe on the named instance")]
+    #[tool(
+        description = "Inject a swipe on the named instance; waits for InputAck unless wait is false. Rejected when the board has no touch."
+    )]
     async fn inject_swipe(
         &self,
         Parameters(params): Parameters<InjectSwipeParams>,
@@ -628,7 +796,9 @@ impl McpServer {
         )
     }
 
-    #[tool(description = "Enable or disable remote inject on the named instance")]
+    #[tool(
+        description = "Enable or disable remote inject on the named instance (SetInjectEnabled). Fire-and-forget."
+    )]
     fn set_inject_enabled(
         &self,
         Parameters(params): Parameters<SetInjectEnabledParams>,
@@ -638,7 +808,9 @@ impl McpServer {
         )
     }
 
-    #[tool(description = "Request a panel snapshot; waits for PNG bytes unless wait is false")]
+    #[tool(
+        description = "Request a panel snapshot as PNG (MCP image plus metadata). Waits for SnapshotFrame unless wait is false. Optional region crop."
+    )]
     async fn request_snapshot(
         &self,
         Parameters(params): Parameters<SnapshotParams>,
@@ -656,7 +828,9 @@ impl McpServer {
         .await
     }
 
-    #[tool(description = "Set which SimToServer payloads the session should emit")]
+    #[tool(
+        description = "Set which SimToServer payloads observe should emit (read_mask names: register, heartbeat, snapshot, snapshot_error, log, input_ack, input_observed, goodbye). Empty mask emits everything."
+    )]
     fn set_session_view(
         &self,
         Parameters(params): Parameters<SessionViewParams>,
@@ -664,15 +838,21 @@ impl McpServer {
         Self::tool_result(self.set_session_view_json(params.instance_id.as_deref(), params.paths))
     }
 
-    #[tool(description = "Ask the named simulator instance to shut down")]
-    fn shutdown_instance(
+    #[tool(
+        description = "Ask the named instance to shut down (ShutdownRequest). Reaps a child started by start_instance. Fire-and-forget on the session hop."
+    )]
+    async fn shutdown_instance(
         &self,
         Parameters(params): Parameters<InstanceParams>,
     ) -> Result<CallToolResult, McpError> {
-        Self::tool_result(self.shutdown_instance_json(params.instance_id.as_deref()))
+        let queued = self.shutdown_instance_json(params.instance_id.as_deref());
+        self.reap_if_spawned(params.instance_id.as_deref()).await;
+        Self::tool_result(queued)
     }
 
-    #[tool(description = "Drain inbound session events, including human and remote InputObserved")]
+    #[tool(
+        description = "Drain inbound session events for the named instance, including human and remote InputObserved. Honors the last set_session_view mask."
+    )]
     fn observe(
         &self,
         Parameters(params): Parameters<InstanceParams>,
@@ -684,7 +864,7 @@ impl McpServer {
 #[tool_handler(
     name = "crosspoint-simulator-mcp-proxy",
     version = "0.1.0",
-    instructions = "Control and observe connected eBook firmware simulator instances. Tools that target a session require instance_id unless --default-instance is set."
+    instructions = "Control and observe eBook firmware simulator instances over Session. A session appears when a simulator dials this process, or when start_instance launches the operator-configured --simulator binary. This server does not build firmware or accept a client-supplied binary path. Board and compile-time firmware options stay in the binary; Register reports them after connect. Tools that target a session require instance_id (1-64 bytes) unless --default-instance is set. Do not omit an id when only one simulator is connected. start_instance always requires an explicit instance_id and defaults to headless. Use list_instances and get_instance to see connected peers. inject_touch, inject_key, inject_home, and inject_swipe wait for InputAck unless wait is false. request_snapshot waits for a PNG SnapshotFrame. observe drains inbound events including human and remote InputObserved. shutdown_instance sends ShutdownRequest and reaps a child this server started. Read csm://capabilities for the machine-readable surface. csm://instances lists connections; csm://instances/{id} is one snapshot."
 )]
 impl ServerHandler for McpServer {
     fn get_info(&self) -> ServerInfo {
@@ -695,9 +875,7 @@ impl ServerHandler for McpServer {
                 .build(),
         )
         .with_server_info(Implementation::from_build_env())
-        .with_instructions(
-            "Control and observe connected eBook firmware simulator instances. Tools that target a session require instance_id unless --default-instance is set.",
-        )
+        .with_instructions(INSTRUCTIONS)
     }
 
     async fn list_resources(
@@ -705,11 +883,20 @@ impl ServerHandler for McpServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, McpError> {
-        let mut resources = vec![Resource::new(INSTANCES_URI, "instances")];
+        let mut resources = vec![
+            Resource::new(CAPABILITIES_URI, "capabilities").with_description(
+                "Machine-readable MCP surface: tools, resources, instance-id rules, and spawn",
+            ),
+            Resource::new(INSTANCES_URI, "instances")
+                .with_description("Connected simulator instances (register and last heartbeat)"),
+        ];
         let mut ids = self.instances.list();
         ids.sort();
         for id in ids {
-            resources.push(Resource::new(Self::instance_uri(&id), id));
+            resources.push(
+                Resource::new(Self::instance_uri(&id), id.clone())
+                    .with_description("One connected instance snapshot"),
+            );
         }
         Ok(ListResourcesResult::with_all_items(resources))
     }
@@ -720,7 +907,9 @@ impl ServerHandler for McpServer {
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourceTemplatesResult, McpError> {
         Ok(ListResourceTemplatesResult::with_all_items(vec![
-            ResourceTemplate::new("csm://instances/{id}", "instance"),
+            ResourceTemplate::new("csm://instances/{id}", "instance").with_description(
+                "Snapshot of one connected instance (register and last heartbeat)",
+            ),
         ]))
     }
 
@@ -729,6 +918,13 @@ impl ServerHandler for McpServer {
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, McpError> {
+        if request.uri == CAPABILITIES_URI {
+            return Ok(ReadResourceResult::new(vec![ResourceContents::text(
+                Self::capabilities_json(self.spawn.configured()).to_string(),
+                CAPABILITIES_URI,
+            )])
+            .into());
+        }
         if request.uri == INSTANCES_URI {
             return Ok(ReadResourceResult::new(vec![ResourceContents::text(
                 self.read_instances_resource(),
@@ -754,17 +950,25 @@ impl ServerHandler for McpServer {
 /// Serve MCP on stdio. Writes only JSON-RPC to stdout.
 pub async fn serve_mcp_stdio(
     instances: InstanceMap,
+    spawn: SpawnConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let running = McpServer::new(instances).serve(stdio()).await?;
-    running.waiting().await?;
+    let server = McpServer::with_spawn(instances, spawn);
+    let running = server.clone().serve(stdio()).await?;
+    let result = running.waiting().await;
+    server.reap_spawned().await;
+    result?;
     Ok(())
 }
 
 /// Streamable HTTP router mounted at `/mcp`.
 pub fn mcp_http_router(instances: InstanceMap) -> Router {
+    mcp_http_router_from_server(McpServer::new(instances))
+}
+
+fn mcp_http_router_from_server(server: McpServer) -> Router {
     let config = StreamableHttpServerConfig::default().with_json_response(true);
     let service = StreamableHttpService::new(
-        move || Ok(McpServer::new(instances.clone())),
+        move || Ok(server.clone()),
         Arc::new(LocalSessionManager::default()),
         config,
     );
@@ -775,9 +979,10 @@ pub fn mcp_http_router(instances: InstanceMap) -> Router {
 pub async fn serve_mcp_http(
     addr: std::net::SocketAddr,
     instances: InstanceMap,
+    spawn: SpawnConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = TcpListener::bind(addr).await?;
-    serve_mcp_http_listener(listener, instances).await
+    serve_mcp_http_listener_with_spawn(listener, instances, spawn).await
 }
 
 /// Serve MCP over Streamable HTTP on an already-bound listener.
@@ -785,7 +990,18 @@ pub async fn serve_mcp_http_listener(
     listener: TcpListener,
     instances: InstanceMap,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    axum::serve(listener, mcp_http_router(instances)).await?;
+    serve_mcp_http_listener_with_spawn(listener, instances, SpawnConfig::default()).await
+}
+
+async fn serve_mcp_http_listener_with_spawn(
+    listener: TcpListener,
+    instances: InstanceMap,
+    spawn: SpawnConfig,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let server = McpServer::with_spawn(instances, spawn);
+    let result = axum::serve(listener, mcp_http_router_from_server(server.clone())).await;
+    server.reap_spawned().await;
+    result?;
     Ok(())
 }
 
@@ -1282,6 +1498,77 @@ mod tests {
                 .find_map(ContentBlock::as_text)
                 .map(|text| text.text.as_str()),
             Some("unexpected session reply")
+        );
+    }
+
+    #[test]
+    fn capabilities_and_instructions_describe_the_surface() {
+        let info = McpServer::new(InstanceMap::new()).get_info();
+        let instructions = info.instructions.expect("instructions");
+        assert!(instructions.contains("start_instance"));
+        assert!(instructions.contains("csm://capabilities"));
+        assert!(!instructions.is_empty());
+        let caps = McpServer::capabilities_json(false);
+        assert_eq!(caps["spawn"]["configured"], false);
+        assert_eq!(caps["spawn"]["firmwareBuild"], false);
+        assert_eq!(caps["spawn"]["clientPassesBinary"], false);
+        let tools = caps["tools"].as_array().expect("tools");
+        assert_eq!(tools.len(), TOOL_NAMES.len());
+        for name in TOOL_NAMES {
+            assert!(tools.iter().any(|value| value == *name), "{name}");
+        }
+        assert_eq!(
+            McpServer::capabilities_json(true)["spawn"]["configured"],
+            true
+        );
+    }
+
+    #[tokio::test]
+    async fn start_instance_errors_when_spawn_is_unset_or_already_connected() {
+        let mcp = McpServer::new(InstanceMap::new());
+        assert_eq!(
+            mcp.start_instance_json("e2e-a", true, None)
+                .await
+                .unwrap_err(),
+            "spawn is not configured; set --simulator / CSM_SIMULATOR"
+        );
+        let map = InstanceMap::new();
+        insert(&map, "sim-a");
+        let mcp = McpServer::with_spawn(
+            map,
+            SpawnConfig {
+                binary: Some(PathBuf::from("/bin/sh")),
+                ..SpawnConfig::default()
+            },
+        );
+        assert_eq!(
+            mcp.start_instance_json("sim-a", true, None)
+                .await
+                .unwrap_err(),
+            "instance is already connected"
+        );
+        assert_eq!(
+            mcp.start_instance_json("", true, None).await.unwrap_err(),
+            "instance_id is required (1-64 bytes)"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_instance_times_out_without_register() {
+        let mcp = McpServer::with_spawn(
+            InstanceMap::new(),
+            SpawnConfig {
+                binary: Some(PathBuf::from("/bin/sh")),
+                extra_args: vec!["-c".into(), "sleep 30".into()],
+                wait: Duration::from_millis(250),
+                ..SpawnConfig::default()
+            },
+        );
+        assert_eq!(
+            mcp.start_instance_json("no-reg", true, None)
+                .await
+                .unwrap_err(),
+            "timed out waiting for register"
         );
     }
 }
