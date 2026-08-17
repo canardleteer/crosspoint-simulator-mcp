@@ -9,6 +9,7 @@ async fn main() -> ExitCode {
     match csm_proxy::run(args).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
+            tracing::error!(error = %err, "proxy exited");
             eprintln!("{err}");
             ExitCode::FAILURE
         }

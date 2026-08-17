@@ -2,6 +2,7 @@
 
 pub mod cli;
 pub mod instances;
+pub mod logging;
 pub mod mcp;
 pub mod session;
 pub mod spawn;
@@ -15,27 +16,40 @@ pub use instances::{
     INSTANCE_ID_MAX_LEN, InstanceMap, InstanceSnapshot, QUEUE_CAPACITY, REPLY_TIMEOUT,
     ResolveError, TrySendError, WaitError, is_valid_instance_id,
 };
+pub use logging::{DEFAULT_FILTER, filter_from_env, init_tracing};
 pub use mcp::{
     CAPABILITIES_URI, INSTRUCTIONS, McpServer, TOOL_NAMES, serve_mcp_http, serve_mcp_http_listener,
     serve_mcp_stdio,
 };
 pub use session::SessionService;
-pub use spawn::{SPAWN_WAIT, SpawnConfig, SpawnError, SpawnSupervisor, default_cwd, spawn_argv};
+pub use spawn::{
+    SAMPLE_BOOK_EPUB, SAMPLE_BOOK_FILENAME, SPAWN_WAIT, SpawnConfig, SpawnError, SpawnSupervisor,
+    default_cwd, seed_sample_book, spawn_argv,
+};
 
 /// Bind and serve inbound `Session` on `addr` until the process exits.
 pub async fn serve(
     addr: SocketAddr,
     instances: InstanceMap,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    tracing::info!(%addr, "session listener binding");
     let router = SessionService::new(instances).router();
     Server::new(router).serve(addr).await
 }
 
 /// Listen for inbound `Session` and serve one MCP transport until either ends.
 pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_tracing();
     let instances = InstanceMap::new();
     args.apply_instance_hints(&instances);
     let spawn = SpawnConfig::from_args(&args);
+    tracing::info!(
+        listen = %args.listen,
+        mcp = args.mcp_http.map(|addr| addr.to_string()).unwrap_or_else(|| "stdio".into()),
+        default_instance = args.default_instance.as_deref(),
+        simulator = ?spawn.binary,
+        "proxy starting"
+    );
     let session = serve(args.listen, instances.clone());
     match args.mcp_http {
         Some(mcp_addr) => {

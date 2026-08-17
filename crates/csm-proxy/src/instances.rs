@@ -83,7 +83,15 @@ impl InboundQueue {
     fn push(&self, msg: SimToServer) {
         let mut q = self.items.lock().expect("inbound queue lock");
         if q.len() == self.cap {
-            q.pop_front();
+            if InstanceMap::is_heartbeat(&msg) {
+                // Latest heartbeat is already on `Instance.last_heartbeat`.
+                return;
+            }
+            if let Some(index) = q.iter().position(InstanceMap::is_heartbeat) {
+                q.remove(index);
+            } else {
+                q.pop_front();
+            }
         }
         q.push_back(msg);
     }
@@ -346,6 +354,10 @@ impl InstanceMap {
     }
 
     /// Complete a corr waiter (if any) and enqueue the inbound envelope.
+    ///
+    /// A non-empty session-view mask is applied here so masked heartbeats do
+    /// not evict logs from the observe queue. Heartbeats still update
+    /// `last_heartbeat` in the session reader before this call.
     pub fn push_inbound(&self, instance_id: &str, msg: SimToServer) {
         self.complete_waiter(&msg);
         if let Some(inst) = self
@@ -354,8 +366,15 @@ impl InstanceMap {
             .expect("instance map lock")
             .get(instance_id)
         {
+            if !Self::inbound_visible(&inst.read_mask, &msg) {
+                return;
+            }
             inst.inbound.push(msg);
         }
+    }
+
+    fn is_heartbeat(msg: &SimToServer) -> bool {
+        matches!(msg.payload, Some(sim_to_server::Payload::Heartbeat(_)))
     }
 
     /// Enqueue `msg` and wait for a corr-matched inbound reply.
@@ -440,7 +459,7 @@ pub struct InboundSink {
 }
 
 impl InboundSink {
-    /// Push, dropping the oldest item when the queue is full.
+    /// Push, dropping a heartbeat (or otherwise the oldest item) when full.
     pub fn push(&self, msg: SimToServer) {
         self.queue.push(msg);
     }
@@ -544,6 +563,71 @@ mod tests {
         assert_eq!(map.try_recv_inbound("q").unwrap().seq, 2);
         assert_eq!(map.try_recv_inbound("q").unwrap().seq, 3);
         assert!(map.try_recv_inbound("q").is_none());
+    }
+
+    fn heartbeat(seq: u64) -> SimToServer {
+        SimToServer {
+            seq,
+            payload: Some(Heartbeat::default().into()),
+            ..Default::default()
+        }
+    }
+
+    fn log_line(seq: u64, text: &str) -> SimToServer {
+        SimToServer {
+            seq,
+            payload: Some(
+                LogLine {
+                    text: text.into(),
+                    ..Default::default()
+                }
+                .into(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn inbound_prefers_dropping_heartbeats_when_full() {
+        let map = InstanceMap::new();
+        let (tx, _rx) = mpsc::channel(1);
+        let (_token, sink) = map.insert(register("q"), 2, tx);
+        sink.push(heartbeat(1));
+        sink.push(log_line(2, "keep"));
+        sink.push(heartbeat(3));
+        let first = map.try_recv_inbound("q").unwrap();
+        let second = map.try_recv_inbound("q").unwrap();
+        assert!(matches!(
+            first.payload,
+            Some(sim_to_server::Payload::Heartbeat(_))
+        ));
+        assert_eq!(first.seq, 1);
+        assert!(matches!(
+            second.payload,
+            Some(sim_to_server::Payload::Log(_))
+        ));
+        assert_eq!(second.seq, 2);
+        assert!(map.try_recv_inbound("q").is_none());
+
+        sink.push(heartbeat(4));
+        sink.push(heartbeat(5));
+        sink.push(log_line(6, "later"));
+        let kept: Vec<u64> = std::iter::from_fn(|| map.try_recv_inbound("q").map(|msg| msg.seq))
+            .collect();
+        assert!(kept.contains(&6), "{kept:?}");
+        assert!(!kept.contains(&4) || !kept.contains(&5), "{kept:?}");
+    }
+
+    #[test]
+    fn push_inbound_skips_payloads_outside_the_session_view() {
+        let map = InstanceMap::new();
+        insert_id(&map, "a");
+        map.set_read_mask("a", vec!["log".into()]);
+        map.push_inbound("a", heartbeat(1));
+        map.push_inbound("a", log_line(2, "keep"));
+        let got = map.try_recv_inbound("a").unwrap();
+        assert_eq!(got.seq, 2);
+        assert!(map.try_recv_inbound("a").is_none());
     }
 
     #[test]

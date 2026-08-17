@@ -214,6 +214,11 @@ async fn streamable_http_calls_a_tool() {
             let body: Value = serde_json::from_str(text).expect("capabilities json");
             assert_eq!(body["spawn"]["configured"], false);
             assert_eq!(body["spawn"]["tool"], "start_instance");
+            assert_eq!(body["spawn"]["sampleBookDefault"], true);
+            assert_eq!(
+                body["spawn"]["sampleBook"]["filename"],
+                "CrossPoint-Reader.epub"
+            );
         }
         other => panic!("unexpected capabilities: {other:?}"),
     }

@@ -48,10 +48,15 @@ client-supplied binary path. Board and compile-time firmware options stay in the
 Register reports them after connect. Tools that target a session require instance_id \
 (1-64 bytes) unless --default-instance is set. Do not omit an id when only one simulator \
 is connected. start_instance always requires an explicit instance_id and defaults to \
-headless. Use list_instances and get_instance to see connected peers. inject_touch, \
+headless. sample_book (default true) seeds fs_/books/CrossPoint-Reader.epub from the \
+committed README fixture; pass false for an empty library. Use list_instances and \
+get_instance to see connected peers. inject_touch, \
 inject_key, inject_home, and inject_swipe wait for InputAck unless wait is false. \
 request_snapshot waits for a PNG SnapshotFrame. observe drains inbound events including \
-human and remote InputObserved. shutdown_instance sends ShutdownRequest and reaps a child \
+human and remote InputObserved. InputAck means the inject was queued, not that the panel \
+painted; after inject, observe for ACT/ERS/GFX logs or a framebufferGeneration bump. \
+Do not sleep as synchronization. Tap (inject_touch) when Register.capTouch is true; \
+default X4 has no touch and no Home. shutdown_instance sends ShutdownRequest and reaps a child \
 this server started. Read csm://capabilities for the machine-readable surface. \
 csm://instances lists connections; csm://instances/{id} is one snapshot.";
 
@@ -118,6 +123,13 @@ impl McpServer {
                 "configured": spawn_configured,
                 "tool": "start_instance",
                 "headlessDefault": true,
+                "sampleBookDefault": true,
+                "sampleBook": {
+                    "param": "sample_book",
+                    "filename": "CrossPoint-Reader.epub",
+                    "sdPath": "/books/CrossPoint-Reader.epub",
+                    "source": "https://github.com/canardleteer/crosspoint-reader/blob/develop/README.md",
+                },
                 "clientPassesBinary": false,
                 "firmwareBuild": false,
             },
@@ -156,9 +168,13 @@ impl McpServer {
             payload: Some(payload.into()),
             ..Default::default()
         };
-        self.instances.try_send(&id, msg).map_err(|err| match err {
-            TrySendError::UnknownInstance => "unknown instance".to_string(),
-            TrySendError::QueueFull => "outbound queue is full".to_string(),
+        self.instances.try_send(&id, msg).map_err(|err| {
+            let text = match err {
+                TrySendError::UnknownInstance => "unknown instance".to_string(),
+                TrySendError::QueueFull => "outbound queue is full".to_string(),
+            };
+            tracing::warn!(instance_id = %id, error = %text, "enqueue failed");
+            text
         })?;
         Ok(json!({
             "queued": true,
@@ -278,6 +294,7 @@ impl McpServer {
                 events.push(serde_json::to_value(&msg).unwrap_or(Value::Null));
             }
         }
+        tracing::debug!(instance_id = %id, events = events.len(), "observe drain");
         Ok(json!({
             "instanceId": id,
             "events": events,
@@ -471,7 +488,15 @@ impl McpServer {
 
     /// Enqueue a shutdown request.
     pub fn shutdown_instance_json(&self, instance_id: Option<&str>) -> Result<Value, String> {
-        self.enqueue(instance_id, false, ShutdownRequest::default())
+        let queued = self.enqueue(instance_id, false, ShutdownRequest::default());
+        match &queued {
+            Ok(body) => tracing::info!(
+                instance_id = body.get("instanceId").and_then(|v| v.as_str()),
+                "shutdown_instance queued"
+            ),
+            Err(err) => tracing::warn!(?instance_id, error = %err, "shutdown_instance failed"),
+        }
+        queued
     }
 
     /// Start the configured binary and wait for `Register`.
@@ -480,6 +505,7 @@ impl McpServer {
         instance_id: &str,
         headless: bool,
         cwd: Option<&str>,
+        sample_book: bool,
     ) -> Result<Value, String> {
         if !crate::is_valid_instance_id(instance_id) {
             return Err(SpawnError::InvalidId.as_str());
@@ -488,12 +514,22 @@ impl McpServer {
         let cwd_path = cwd.map(PathBuf::from);
         let pid = self
             .spawn
-            .start(instance_id, headless, cwd_path.as_deref(), connected)
+            .start(
+                instance_id,
+                headless,
+                cwd_path.as_deref(),
+                connected,
+                sample_book,
+            )
             .await
-            .map_err(|err| err.as_str())?;
+            .map_err(|err| {
+                tracing::warn!(instance_id, error = %err.as_str(), "start_instance failed");
+                err.as_str()
+            })?;
         let deadline = Instant::now() + self.spawn.wait();
         loop {
             if let Some(snap) = self.instances.get(instance_id) {
+                tracing::info!(instance_id, pid, "start_instance registered");
                 return Ok(json!({
                     "instanceId": snap.register.instance_id,
                     "pid": pid,
@@ -503,10 +539,12 @@ impl McpServer {
             }
             if !self.spawn.is_alive(instance_id) {
                 self.spawn.reap(instance_id).await;
+                tracing::warn!(instance_id, "start_instance: child exited before register");
                 return Err(SpawnError::ExitedBeforeRegister.as_str());
             }
             if Instant::now() >= deadline {
                 self.spawn.reap(instance_id).await;
+                tracing::warn!(instance_id, "start_instance: register timeout");
                 return Err(SpawnError::RegisterTimeout.as_str());
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -559,6 +597,10 @@ fn default_wait() -> bool {
 }
 
 fn default_headless() -> bool {
+    true
+}
+
+fn default_sample_book() -> bool {
     true
 }
 
@@ -691,6 +733,10 @@ struct StartInstanceParams {
     /// Working directory. When omitted, a per-instance directory under `$TMPDIR`.
     #[serde(default)]
     cwd: Option<String>,
+    /// When true (default), copy the committed CrossPoint Reader README EPUB
+    /// into `fs_/books/` under the instance working directory.
+    #[serde(default = "default_sample_book")]
+    sample_book: bool,
 }
 
 #[tool_router]
@@ -713,15 +759,20 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Start the operator-configured --simulator binary and wait for Register. Requires an explicit instance_id. Defaults to headless. Fails if spawn is not configured, the id is already connected, or Register times out. Does not build firmware."
+        description = "Start the operator-configured --simulator binary and wait for Register. Requires an explicit instance_id. Defaults to headless. sample_book (default true) seeds fs_/books/CrossPoint-Reader.epub from the committed README fixture. Fails if spawn is not configured, the id is already connected, or Register times out. Does not build firmware."
     )]
     async fn start_instance(
         &self,
         Parameters(params): Parameters<StartInstanceParams>,
     ) -> Result<CallToolResult, McpError> {
         Self::tool_result(
-            self.start_instance_json(&params.instance_id, params.headless, params.cwd.as_deref())
-                .await,
+            self.start_instance_json(
+                &params.instance_id,
+                params.headless,
+                params.cwd.as_deref(),
+                params.sample_book,
+            )
+            .await,
         )
     }
 
@@ -864,7 +915,7 @@ impl McpServer {
 #[tool_handler(
     name = "crosspoint-simulator-mcp-proxy",
     version = "0.1.0",
-    instructions = "Control and observe eBook firmware simulator instances over Session. A session appears when a simulator dials this process, or when start_instance launches the operator-configured --simulator binary. This server does not build firmware or accept a client-supplied binary path. Board and compile-time firmware options stay in the binary; Register reports them after connect. Tools that target a session require instance_id (1-64 bytes) unless --default-instance is set. Do not omit an id when only one simulator is connected. start_instance always requires an explicit instance_id and defaults to headless. Use list_instances and get_instance to see connected peers. inject_touch, inject_key, inject_home, and inject_swipe wait for InputAck unless wait is false. request_snapshot waits for a PNG SnapshotFrame. observe drains inbound events including human and remote InputObserved. shutdown_instance sends ShutdownRequest and reaps a child this server started. Read csm://capabilities for the machine-readable surface. csm://instances lists connections; csm://instances/{id} is one snapshot."
+    instructions = "Control and observe eBook firmware simulator instances over Session. A session appears when a simulator dials this process, or when start_instance launches the operator-configured --simulator binary. This server does not build firmware or accept a client-supplied binary path. Board and compile-time firmware options stay in the binary; Register reports them after connect. Tools that target a session require instance_id (1-64 bytes) unless --default-instance is set. Do not omit an id when only one simulator is connected. start_instance always requires an explicit instance_id and defaults to headless. sample_book (default true) seeds fs_/books/CrossPoint-Reader.epub from the committed README fixture; pass false for an empty library. Use list_instances and get_instance to see connected peers. inject_touch, inject_key, inject_home, and inject_swipe wait for InputAck unless wait is false. request_snapshot waits for a PNG SnapshotFrame. observe drains inbound events including human and remote InputObserved. InputAck means the inject was queued, not that the panel painted; after inject, observe for ACT/ERS/GFX logs or a framebufferGeneration bump. Do not sleep as synchronization. Tap (inject_touch) when Register.capTouch is true; default X4 has no touch and no Home. shutdown_instance sends ShutdownRequest and reaps a child this server started. Read csm://capabilities for the machine-readable surface. csm://instances lists connections; csm://instances/{id} is one snapshot."
 )]
 impl ServerHandler for McpServer {
     fn get_info(&self) -> ServerInfo {
@@ -952,6 +1003,7 @@ pub async fn serve_mcp_stdio(
     instances: InstanceMap,
     spawn: SpawnConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    tracing::info!("mcp serving on stdio");
     let server = McpServer::with_spawn(instances, spawn);
     let running = server.clone().serve(stdio()).await?;
     let result = running.waiting().await;
@@ -998,6 +1050,8 @@ async fn serve_mcp_http_listener_with_spawn(
     instances: InstanceMap,
     spawn: SpawnConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let local = listener.local_addr()?;
+    tracing::info!(%local, "mcp serving streamable http at /mcp");
     let server = McpServer::with_spawn(instances, spawn);
     let result = axum::serve(listener, mcp_http_router_from_server(server.clone())).await;
     server.reap_spawned().await;
@@ -1506,12 +1560,20 @@ mod tests {
         let info = McpServer::new(InstanceMap::new()).get_info();
         let instructions = info.instructions.expect("instructions");
         assert!(instructions.contains("start_instance"));
+        assert!(instructions.contains("sample_book"));
+        assert!(instructions.contains("framebufferGeneration"));
+        assert!(instructions.contains("capTouch"));
         assert!(instructions.contains("csm://capabilities"));
         assert!(!instructions.is_empty());
         let caps = McpServer::capabilities_json(false);
         assert_eq!(caps["spawn"]["configured"], false);
         assert_eq!(caps["spawn"]["firmwareBuild"], false);
         assert_eq!(caps["spawn"]["clientPassesBinary"], false);
+        assert_eq!(caps["spawn"]["sampleBookDefault"], true);
+        assert_eq!(
+            caps["spawn"]["sampleBook"]["filename"],
+            "CrossPoint-Reader.epub"
+        );
         let tools = caps["tools"].as_array().expect("tools");
         assert_eq!(tools.len(), TOOL_NAMES.len());
         for name in TOOL_NAMES {
@@ -1527,7 +1589,7 @@ mod tests {
     async fn start_instance_errors_when_spawn_is_unset_or_already_connected() {
         let mcp = McpServer::new(InstanceMap::new());
         assert_eq!(
-            mcp.start_instance_json("e2e-a", true, None)
+            mcp.start_instance_json("e2e-a", true, None, true)
                 .await
                 .unwrap_err(),
             "spawn is not configured; set --simulator / CSM_SIMULATOR"
@@ -1542,13 +1604,15 @@ mod tests {
             },
         );
         assert_eq!(
-            mcp.start_instance_json("sim-a", true, None)
+            mcp.start_instance_json("sim-a", true, None, true)
                 .await
                 .unwrap_err(),
             "instance is already connected"
         );
         assert_eq!(
-            mcp.start_instance_json("", true, None).await.unwrap_err(),
+            mcp.start_instance_json("", true, None, true)
+                .await
+                .unwrap_err(),
             "instance_id is required (1-64 bytes)"
         );
     }
@@ -1565,7 +1629,7 @@ mod tests {
             },
         );
         assert_eq!(
-            mcp.start_instance_json("no-reg", true, None)
+            mcp.start_instance_json("no-reg", true, None, false)
                 .await
                 .unwrap_err(),
             "timed out waiting for register"

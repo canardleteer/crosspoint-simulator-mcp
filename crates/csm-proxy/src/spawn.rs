@@ -15,6 +15,12 @@ use crate::is_valid_instance_id;
 /// How long `start_instance` waits for `Register` by default.
 pub const SPAWN_WAIT: Duration = Duration::from_secs(15);
 
+/// Filename written under `fs_/books/` when `sample_book` is true.
+pub const SAMPLE_BOOK_FILENAME: &str = "CrossPoint-Reader.epub";
+
+/// Committed EPUB 2 built from the CrossPoint Reader README.
+pub const SAMPLE_BOOK_EPUB: &[u8] = include_bytes!("../fixtures/crosspoint-reader.epub");
+
 /// Operator-configured binary and Session listen address.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SpawnConfig {
@@ -121,6 +127,15 @@ pub fn default_cwd(instance_id: &str) -> PathBuf {
     dir
 }
 
+/// Write the sample EPUB to `{cwd}/fs_/books/CrossPoint-Reader.epub`.
+pub fn seed_sample_book(cwd: &Path) -> Result<PathBuf, String> {
+    let dir = cwd.join("fs_").join("books");
+    std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+    let path = dir.join(SAMPLE_BOOK_FILENAME);
+    std::fs::write(&path, SAMPLE_BOOK_EPUB).map_err(|err| err.to_string())?;
+    Ok(path)
+}
+
 fn safe_dir_name(id: &str) -> String {
     if !id.is_empty()
         && id
@@ -178,8 +193,10 @@ impl SpawnSupervisor {
         headless: bool,
         cwd: Option<&Path>,
         already_connected: bool,
+        sample_book: bool,
     ) -> Result<u32, SpawnError> {
         if !is_valid_instance_id(instance_id) {
+            tracing::warn!(instance_id, "spawn rejected: invalid instance_id");
             return Err(SpawnError::InvalidId);
         }
         let binary = self
@@ -188,11 +205,13 @@ impl SpawnSupervisor {
             .as_ref()
             .ok_or(SpawnError::NotConfigured)?;
         if already_connected {
+            tracing::warn!(instance_id, "spawn rejected: already connected");
             return Err(SpawnError::AlreadyConnected);
         }
         {
             let mut inner = self.inner.lock().expect("spawn lock");
             if inner.starting.contains(instance_id) || child_alive(&mut inner, instance_id) {
+                tracing::warn!(instance_id, "spawn rejected: already spawned");
                 return Err(SpawnError::AlreadySpawned);
             }
             inner.starting.insert(instance_id.to_string());
@@ -204,7 +223,22 @@ impl SpawnSupervisor {
         };
         if let Err(err) = std::fs::create_dir_all(&workdir) {
             self.clear_starting(instance_id);
+            tracing::warn!(instance_id, error = %err, "spawn cwd create failed");
             return Err(SpawnError::SpawnFailed(err.to_string()));
+        }
+        if sample_book {
+            match seed_sample_book(&workdir) {
+                Ok(path) => tracing::info!(
+                    instance_id,
+                    path = %path.display(),
+                    "seeded sample book"
+                ),
+                Err(err) => {
+                    self.clear_starting(instance_id);
+                    tracing::warn!(instance_id, error = %err, "sample book seed failed");
+                    return Err(SpawnError::SpawnFailed(err));
+                }
+            }
         }
 
         let argv = spawn_argv(
@@ -221,14 +255,24 @@ impl SpawnSupervisor {
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .kill_on_drop(true);
+        tracing::debug!(instance_id, argv = ?argv, cwd = %workdir.display(), "spawn argv");
         let child = match cmd.spawn() {
             Ok(child) => child,
             Err(err) => {
                 self.clear_starting(instance_id);
+                tracing::warn!(instance_id, error = %err, "spawn exec failed");
                 return Err(SpawnError::SpawnFailed(err.to_string()));
             }
         };
         let pid = child.id().unwrap_or(0);
+        tracing::info!(
+            instance_id,
+            pid,
+            binary = %binary.display(),
+            headless,
+            cwd = %workdir.display(),
+            "spawned simulator (child stderr inherited)"
+        );
         {
             let mut inner = self.inner.lock().expect("spawn lock");
             inner.starting.remove(instance_id);
@@ -247,6 +291,7 @@ impl SpawnSupervisor {
         let Some(child) = child.as_mut() else {
             return;
         };
+        tracing::info!(instance_id, "reaping spawned simulator");
         let _ = child.start_kill();
         let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
     }
@@ -353,7 +398,10 @@ mod tests {
     async fn start_rejects_unset_binary_and_bad_id() {
         let supervisor = SpawnSupervisor::new(SpawnConfig::default());
         assert_eq!(
-            supervisor.start("ok", true, None, false).await.unwrap_err(),
+            supervisor
+                .start("ok", true, None, false, false)
+                .await
+                .unwrap_err(),
             SpawnError::NotConfigured
         );
         let supervisor = SpawnSupervisor::new(SpawnConfig {
@@ -361,11 +409,17 @@ mod tests {
             ..SpawnConfig::default()
         });
         assert_eq!(
-            supervisor.start("", true, None, false).await.unwrap_err(),
+            supervisor
+                .start("", true, None, false, false)
+                .await
+                .unwrap_err(),
             SpawnError::InvalidId
         );
         assert_eq!(
-            supervisor.start("ok", true, None, true).await.unwrap_err(),
+            supervisor
+                .start("ok", true, None, true, false)
+                .await
+                .unwrap_err(),
             SpawnError::AlreadyConnected
         );
     }
@@ -379,19 +433,71 @@ mod tests {
             ..SpawnConfig::default()
         });
         let pid = supervisor
-            .start("sleepy", true, None, false)
+            .start("sleepy", true, None, false, false)
             .await
             .expect("sleep starts");
         assert!(pid > 0);
         assert!(supervisor.is_alive("sleepy"));
         assert_eq!(
             supervisor
-                .start("sleepy", true, None, false)
+                .start("sleepy", true, None, false, false)
                 .await
                 .unwrap_err(),
             SpawnError::AlreadySpawned
         );
         supervisor.reap("sleepy").await;
         assert!(!supervisor.is_alive("sleepy"));
+    }
+
+    #[test]
+    fn seed_sample_book_writes_epub_under_fs_books() {
+        let dir = std::env::temp_dir().join(format!("csm-sample-book-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = seed_sample_book(&dir).expect("seed");
+        assert_eq!(path.file_name().unwrap(), SAMPLE_BOOK_FILENAME);
+        assert!(path.starts_with(dir.join("fs_").join("books")));
+        let bytes = std::fs::read(&path).expect("read");
+        assert_eq!(bytes, SAMPLE_BOOK_EPUB);
+        assert!(bytes.starts_with(b"PK"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn start_seeds_sample_book_only_when_requested() {
+        let with_book = std::env::temp_dir().join(format!("csm-seed-yes-{}", std::process::id()));
+        let without = std::env::temp_dir().join(format!("csm-seed-no-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&with_book);
+        let _ = std::fs::remove_dir_all(&without);
+        let supervisor = SpawnSupervisor::new(SpawnConfig {
+            binary: Some(PathBuf::from("/bin/sh")),
+            extra_args: vec!["-c".into(), "sleep 30".into()],
+            ..SpawnConfig::default()
+        });
+        supervisor
+            .start("seed-yes", true, Some(&with_book), false, true)
+            .await
+            .expect("start with book");
+        supervisor
+            .start("seed-no", true, Some(&without), false, false)
+            .await
+            .expect("start without book");
+        assert!(
+            with_book
+                .join("fs_")
+                .join("books")
+                .join(SAMPLE_BOOK_FILENAME)
+                .is_file()
+        );
+        assert!(
+            !without
+                .join("fs_")
+                .join("books")
+                .join(SAMPLE_BOOK_FILENAME)
+                .is_file()
+        );
+        supervisor.reap("seed-yes").await;
+        supervisor.reap("seed-no").await;
+        let _ = std::fs::remove_dir_all(&with_book);
+        let _ = std::fs::remove_dir_all(&without);
     }
 }

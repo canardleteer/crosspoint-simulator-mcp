@@ -40,8 +40,12 @@ impl SimulatorControlService for SessionService {
     ) -> ServiceResult<ServiceStream<impl connectrpc::Encodable<ServerToSim> + Send + use<>>> {
         let first = match requests.next().await {
             Some(Ok(msg)) => msg.to_owned_message(),
-            Some(Err(err)) => return Err(err),
+            Some(Err(err)) => {
+                tracing::warn!(error = %err, "session inbound failed before register");
+                return Err(err);
+            }
             None => {
+                tracing::warn!("session opened with no messages");
                 return Err(ConnectError::invalid_argument(
                     "session opened with no messages",
                 ));
@@ -49,6 +53,7 @@ impl SimulatorControlService for SessionService {
         };
 
         let Some(sim_to_server::Payload::Register(register)) = first.payload else {
+            tracing::warn!("session first message was not register");
             return Err(ConnectError::invalid_argument(
                 "first session message must be Register",
             ));
@@ -56,11 +61,23 @@ impl SimulatorControlService for SessionService {
         let register = *register;
         let instance_id = register.instance_id.clone();
         if !is_valid_instance_id(&instance_id) {
+            tracing::warn!(
+                instance_id,
+                "session register rejected: invalid instance_id"
+            );
             return Err(ConnectError::invalid_argument(
                 "instance_id must be 1-64 bytes",
             ));
         }
 
+        tracing::info!(
+            instance_id = %instance_id,
+            board_id = %register.board_id,
+            controller = %register.controller,
+            pid = register.pid,
+            version = %register.version,
+            "session registered"
+        );
         let (outbound_tx, outbound_rx) = mpsc::channel(QUEUE_CAPACITY);
         let (token, _inbound) = self.instances.insert(register, QUEUE_CAPACITY, outbound_tx);
         let instances = self.instances.clone();
@@ -72,6 +89,7 @@ impl SimulatorControlService for SessionService {
                     break;
                 }
                 let Ok(msg) = item else {
+                    tracing::warn!(instance_id = %id_for_loop, "session inbound closed with error");
                     break;
                 };
                 let owned = msg.to_owned_message();
@@ -81,12 +99,16 @@ impl SimulatorControlService for SessionService {
                         instances.push_inbound(&id_for_loop, owned);
                     }
                     Some(sim_to_server::Payload::Goodbye(_)) => {
+                        tracing::info!(instance_id = %id_for_loop, "session goodbye");
                         instances.push_inbound(&id_for_loop, owned);
                         instances.remove_if(&id_for_loop, token);
                         break;
                     }
                     _ => instances.push_inbound(&id_for_loop, owned),
                 }
+            }
+            if instances.owns(&id_for_loop, token) {
+                tracing::info!(instance_id = %id_for_loop, "session disconnected");
             }
             instances.remove_if(&id_for_loop, token);
         });

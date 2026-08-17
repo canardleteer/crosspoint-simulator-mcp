@@ -19,8 +19,11 @@ reports them after connect. `--simulator-arg` / `CSM_SIMULATOR_ARGS`
 are extra argv this server appends before Session flags it controls
 (`--sim-grpc`, `--sim-grpc-addr` from `--listen`, `--sim-instance-id`,
 and `--sim-headless` when requested). `start_instance` requires an
-explicit instance id (1–64 bytes) and defaults to headless. This
-process does not auto-start a simulator on boot.
+explicit instance id (1–64 bytes) and defaults to headless. It also
+defaults to seeding the committed sample EPUB
+(`fs_/books/CrossPoint-Reader.epub`, from the CrossPoint Reader
+README) unless `sample_book` is false. This process does not
+auto-start a simulator on boot.
 
 Instance ids are required and cannot be empty: `Register.instance_id`
 and every later selector must be 1–64 bytes. Do not omit an id when
@@ -31,10 +34,11 @@ when that flag is a valid id. Clients discover the surface from
 initialize instructions, `tools/list`, and `csm://capabilities`.
 
 This process is the MCP peer (`rmcp`). Default MCP transport is stdio
-(JSON-RPC only on stdout; logs go to stderr). `--mcp-http` /
-`CSM_MCP_HTTP` selects Streamable HTTP instead, mounted at `/mcp`.
-The gRPC `Session` listener stays up either way. The simulator is not
-an MCP peer.
+(JSON-RPC only on stdout; logs go to stderr). Use the `tracing` crate
+and `RUST_LOG` for process logs. When `RUST_LOG` is unset, the default
+filter is `csm_proxy=info`. `--mcp-http` / `CSM_MCP_HTTP` selects
+Streamable HTTP instead, mounted at `/mcp`. The gRPC `Session`
+listener stays up either way. The simulator is not an MCP peer.
 
 Inject tools (`touch` / `key` / `home` / `swipe`) wait for a corr-matched
 `InputAck` by default. `request_snapshot` waits for `SnapshotFrame` or
@@ -46,6 +50,9 @@ honors the last `SetSessionView.read_mask` (SimToServer payload names:
 `input_ack`, `input_observed`, `goodbye`). An empty mask emits
 everything. Corr waiters still complete if the mask excludes that
 payload. Instance ids stay required as above.
+
+When testing CrossPoint Reader in the simulator over MCP, read
+[`.agents/skills/navigating-as-an-agent/SKILL.md`](.agents/skills/navigating-as-an-agent/SKILL.md).
 
 ## Simulator submodule
 
@@ -202,6 +209,10 @@ subject imperative and focused on why the change exists.
 
 ## Agent Documentation Standards
 
-Maintain this file according to the [AGENTS.md standard](https://agents.md/),
-and keep it portable across compatible agent clients, without assumptions
-about user-specific paths or session state.
+Project-local skills exist under `.agents/skills/` and should remain
+discoverable by agents working in this repository. Maintain those skills
+according to the [Agent Skills specification](https://agentskills.io/specification),
+and maintain this file according to the
+[AGENTS.md standard](https://agents.md/). Keep both portable
+across compatible agent clients, without assumptions about user-specific paths
+or session state.

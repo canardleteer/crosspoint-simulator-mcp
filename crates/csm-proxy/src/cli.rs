@@ -10,7 +10,8 @@ use crate::InstanceMap;
 /// MCP proxy that accepts inbound eBook firmware simulator Session streams.
 ///
 /// A session appears when a simulator dials this process, or when
-/// `start_instance` executes `--simulator`.
+/// `start_instance` executes `--simulator`. Logs go to stderr (`tracing`,
+/// `RUST_LOG`; default `csm_proxy=info`).
 #[derive(Parser, Debug, Clone, PartialEq, Eq)]
 #[command(name = "crosspoint-simulator-mcp-proxy", version, about)]
 pub struct Args {

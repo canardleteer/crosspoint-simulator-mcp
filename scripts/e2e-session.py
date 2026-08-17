@@ -27,6 +27,7 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -242,7 +243,9 @@ class Harness:
         return proc
 
     def start_sim(self, instance_id: str, *, headless: bool = False) -> Proc:
-        extra_env: dict[str, str] = {}
+        extra_env: dict[str, str] = {
+            "CROSSPOINT_SIM_SD": tempfile.mkdtemp(prefix=f"csm-e2e-sd-{instance_id}-"),
+        }
         if not self.args.show_windows and not self.args.human:
             extra_env["SDL_VIDEODRIVER"] = "dummy"
         argv = [
@@ -364,6 +367,67 @@ def observed_keys(events: list[dict[str, Any]], source: str) -> list[str]:
     return names
 
 
+def log_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [event.get("log") or {} for event in events if event.get("log")]
+
+
+def assert_firmware_severity(events: list[dict[str, Any]]) -> None:
+    for log in log_events(events):
+        if log.get("type") != "LOG_TYPE_FIRMWARE_SERIAL":
+            continue
+        text = log.get("text") or ""
+        severity = log.get("severity")
+        if " [ERR] " in text or " [ERROR] " in text:
+            require(severity == "LOG_SEVERITY_ERROR", f"ERR line not ERROR: {log}")
+        elif " [WRN] " in text or " [WARN] " in text:
+            require(severity == "LOG_SEVERITY_WARN", f"WRN line not WARN: {log}")
+        elif " [DBG] " in text or " [DEBUG] " in text:
+            require(severity == "LOG_SEVERITY_DEBUG", f"DBG line not DEBUG: {log}")
+        elif " [INF] " in text or " [INFO] " in text:
+            require(severity == "LOG_SEVERITY_INFO", f"INF line not INFO: {log}")
+
+
+def wait_classified_logs(
+    harness: Harness,
+    instance_id: str,
+    *,
+    timeout: float = 8.0,
+    require_host_open_failed: bool = False,
+    already: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    deadline = time.time() + timeout
+    collected: list[dict[str, Any]] = list(already or [])
+
+    def done() -> bool:
+        assert_firmware_severity(collected)
+        logs = log_events(collected)
+        has_dbg = any(
+            log.get("type") == "LOG_TYPE_FIRMWARE_SERIAL"
+            and log.get("severity") == "LOG_SEVERITY_DEBUG"
+            and " [DBG] " in (log.get("text") or "")
+            for log in logs
+        )
+        has_host_open = any(
+            log.get("type") == "LOG_TYPE_HOST_SIM"
+            and log.get("severity") == "LOG_SEVERITY_ERROR"
+            and "open failed" in (log.get("text") or "")
+            for log in logs
+        )
+        return has_dbg and (has_host_open or not require_host_open_failed)
+
+    if done():
+        return collected
+    while time.time() < deadline:
+        collected.extend(harness.observe_events(instance_id))
+        if done():
+            return collected
+        time.sleep(0.15)
+    raise Fail(
+        f"{instance_id} observe missing classified logs "
+        f"(require_host_open_failed={require_host_open_failed}): {log_events(collected)}"
+    )
+
+
 def run_automated(harness: Harness) -> None:
     harness.start_proxy()
     sim_a = harness.start_sim("e2e-a")
@@ -453,7 +517,6 @@ def run_spawn(harness: Harness) -> None:
     require(int(body.get("pid") or 0) > 0, f"start pid: {body}")
     print("ok start_instance registered e2e-spawn")
 
-    harness.drain_observe("e2e-spawn")
     injected = harness.call(
         "inject_key",
         {"instance_id": "e2e-spawn", "name": "ENTER", "hold_ms": 80},
@@ -470,6 +533,14 @@ def run_spawn(harness: Harness) -> None:
         f"spawn observe saw HUMAN: {events}",
     )
     print("ok inject ENTER is remote")
+
+    wait_classified_logs(
+        harness,
+        "e2e-spawn",
+        require_host_open_failed=True,
+        already=events,
+    )
+    print("ok observe classifies firmware DBG and HOST_SIM open failed")
 
     snap = harness.call("request_snapshot", {"instance_id": "e2e-spawn"})
     require(not tool_error(snap), f"snapshot failed: {tool_text(snap)}")
@@ -497,7 +568,6 @@ def run_headless(harness: Harness) -> None:
     require(sim.alive(), "headless simulator exited before heartbeat")
     print("ok heartbeat reports headless")
 
-    harness.drain_observe("e2e-headless")
     injected = harness.call(
         "inject_key",
         {"instance_id": "e2e-headless", "name": "ENTER", "hold_ms": 80},
@@ -515,6 +585,14 @@ def run_headless(harness: Harness) -> None:
         f"headless observe saw HUMAN: {events}",
     )
     print("ok inject ENTER is remote and not human")
+
+    wait_classified_logs(
+        harness,
+        "e2e-headless",
+        require_host_open_failed=True,
+        already=events,
+    )
+    print("ok observe classifies firmware DBG and host [SIM] logs")
 
     snap = harness.call("request_snapshot", {"instance_id": "e2e-headless"})
     require(not tool_error(snap), f"snapshot failed: {tool_text(snap)}")
