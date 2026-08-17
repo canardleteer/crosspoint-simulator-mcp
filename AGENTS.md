@@ -75,7 +75,7 @@ and change rules.
 
 The submodule tracks
 `https://github.com/canardleteer/crosspoint-simulator` on branch
-`dev/canardleteer/agent-docs-host-platforms`. After clone, initialize it with
+`dev/canardleteer/session-client`. After clone, initialize it with
 `git submodule update --init --recursive`.
 
 ## Rust crates and CLI
