@@ -24,9 +24,11 @@ for knowing the UI finished.
    not as a wait.
 
 `get_instance` carries `lastHeartbeat.framebufferGeneration` (and
-`headless`) and `Register`. Proto3 JSON omits false bools: `capTouch` /
-`capHome` / `capFrontlight` absent means false. Several instances may
-be up at once; always name `instance_id`.
+`headless`) and `Register`. `boardId` is `x4`, `x3`, `x4_pro`,
+`sticky`, or `paper_mono`. `capFrontlight` is any frontlight style
+(including Paper Mono PMIC), not PWM-only. Proto3 JSON omits false
+bools: `capTouch` / `capHome` / `capFrontlight` absent means false.
+Several instances may be up at once; always name `instance_id`.
 
 ## InputAck is not a paint
 

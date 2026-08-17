@@ -157,6 +157,7 @@ impl McpServer {
             "firmware": {
                 "compileTime": true,
                 "see": "Register",
+                "boardIds": ["x4", "x3", "x4_pro", "sticky", "paper_mono"],
             },
         })
     }
@@ -1918,6 +1919,10 @@ mod tests {
         assert_eq!(caps["observe"]["waitMsDefault"], 8000);
         assert_eq!(caps["observe"]["untilLogParam"], "until_log");
         assert_eq!(caps["observe"]["heartbeatAlwaysOnWire"], true);
+        assert_eq!(
+            caps["firmware"]["boardIds"],
+            json!(["x4", "x3", "x4_pro", "sticky", "paper_mono"])
+        );
         assert_eq!(
             caps["spawn"]["sampleBook"]["filename"],
             "CrossPoint-Reader.epub"

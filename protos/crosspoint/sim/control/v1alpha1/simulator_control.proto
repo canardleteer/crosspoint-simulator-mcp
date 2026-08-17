@@ -21,7 +21,7 @@ message Register {
   // Unique id for this simulator process (caller-chosen or generated).
   // Required: 1–64 bytes. Empty is invalid.
   string instance_id = 1;
-  // Board profile: x4, x3, x4_pro, or sticky.
+  // Board profile: x4, x3, x4_pro, sticky, or paper_mono.
   string board_id = 2;
   // Display controller id: ssd1677, uc8179, uc8279, or similar.
   string controller = 3;

@@ -1,4 +1,4 @@
 [submodule "crosspoint-simulator"]
 	path = crosspoint-simulator
 	url = https://github.com/canardleteer/crosspoint-simulator.git
-	branch = dev/canardleteer/session-client
+	branch = dev/canardleteer/session-client-with-better-sim-sdk
