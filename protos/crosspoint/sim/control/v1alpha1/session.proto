@@ -24,7 +24,7 @@ message SimToServer {
   oneof payload {
     // First message on a new stream: identity and device profile.
     Register register = 10;
-    // Periodic liveness and framebuffer generation.
+    // Periodic liveness, framebuffer generation, and last UI state.
     Heartbeat heartbeat = 11;
     // Encoded panel capture for a SnapshotRequest.
     SnapshotFrame snapshot = 12;
@@ -38,6 +38,8 @@ message SimToServer {
     InputObserved input_observed = 16;
     // Stream is closing.
     Goodbye goodbye = 17;
+    // Inject paint outcome; corr matches the inject that requested an ack.
+    UiResult ui_result = 18;
   }
 }
 

@@ -356,7 +356,10 @@ async fn fake_client_acks_an_inject() {
 
     let mcp = McpServer::new(instances);
     let waiter =
-        tokio::spawn(async move { mcp.inject_touch_json(Some("sim-ack"), 3, 8, 9, true).await });
+        tokio::spawn(async move {
+            mcp.inject_touch_json(Some("sim-ack"), 3, 8, 9, true, Some("ack"), None, None)
+                .await
+        });
     let outbound = session
         .message()
         .await
@@ -403,7 +406,7 @@ async fn fake_client_rejects_an_inject() {
 
     let mcp = McpServer::new(instances);
     let waiter = tokio::spawn(async move {
-        mcp.inject_key_json(Some("sim-nack"), "ENTER".into(), 0, true)
+        mcp.inject_key_json(Some("sim-nack"), "ENTER".into(), 0, true, Some("ack"), None)
             .await
     });
     let outbound = session
@@ -541,7 +544,7 @@ async fn inject_wait_times_out_when_the_client_stays_silent() {
 
     let mcp = McpServer::new(instances);
     let err = mcp
-        .inject_home_json(Some("sim-silent"), 0, true)
+        .inject_home_json(Some("sim-silent"), 0, true, None, None)
         .await
         .unwrap_err();
     assert_eq!(err, "timed out waiting for session reply");
@@ -582,7 +585,7 @@ async fn observe_honors_session_view_and_keeps_heartbeat() {
     wait_until(|| instances.get("sim-view").is_some()).await;
 
     let mcp = McpServer::new(instances.clone());
-    mcp.set_session_view_json(Some("sim-view"), vec!["log".into()])
+    mcp.set_session_view_json(Some("sim-view"), vec!["log".into()], vec![])
         .unwrap();
     let view = session
         .message()
@@ -666,7 +669,7 @@ async fn snapshot_wait_completes_when_view_masks_snapshot() {
     wait_until(|| instances.get("sim-mask-snap").is_some()).await;
 
     let mcp = McpServer::new(instances.clone());
-    mcp.set_session_view_json(Some("sim-mask-snap"), vec!["log".into()])
+    mcp.set_session_view_json(Some("sim-mask-snap"), vec!["log".into()], vec![])
         .unwrap();
     let _view = session
         .message()

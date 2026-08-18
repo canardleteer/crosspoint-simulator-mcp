@@ -11,10 +11,23 @@ use csm_pb_bindings::generated::crosspoint::sim::control::v1alpha1::{
 use tokio::sync::{mpsc, oneshot};
 
 /// Capacity of each per-instance inbound and outbound queue.
-pub const QUEUE_CAPACITY: usize = 32;
+pub const QUEUE_CAPACITY: usize = 128;
 
-/// How long MCP waits for a corr-matched `InputAck` or snapshot reply.
+/// How long MCP waits for a corr-matched `InputAck`, `UiResult`, or snapshot reply.
 pub const REPLY_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Which inbound payload completes a [`InstanceMap::send_and_wait_for`] waiter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitKind {
+    /// First inbound envelope with the matching `corr`.
+    Any,
+    /// `InputAck` only.
+    InputAck,
+    /// `UiResult`, or a rejected `InputAck` so paint-wait fails fast.
+    UiResult,
+    /// `SnapshotFrame` or `SnapshotError`.
+    Snapshot,
+}
 
 /// Maximum length of a [`Register::instance_id`] and of any later selector.
 pub const INSTANCE_ID_MAX_LEN: usize = 64;
@@ -87,10 +100,12 @@ impl InboundQueue {
                 // Latest heartbeat is already on `Instance.last_heartbeat`.
                 return;
             }
-            if let Some(index) = q.iter().position(InstanceMap::is_heartbeat) {
+            if let Some(index) = InstanceMap::eviction_index(q.iter()) {
                 q.remove(index);
+            } else if !InstanceMap::is_never_drop(&msg) {
+                return;
             } else {
-                q.pop_front();
+                return;
             }
         }
         q.push_back(msg);
@@ -109,6 +124,8 @@ struct Instance {
     outbound_tx: mpsc::Sender<ServerToSim>,
     /// Last `SetSessionView.read_mask` enqueued by MCP. Empty means emit all.
     read_mask: Vec<String>,
+    /// Last `SetSessionView.exclude_log_components`. Empty means no filter.
+    exclude_log_components: Vec<String>,
 }
 
 /// Shared map of connected simulator sessions.
@@ -118,7 +135,7 @@ pub struct InstanceMap {
     next_token: Arc<AtomicU64>,
     next_corr: Arc<AtomicU64>,
     default_instance: Arc<Mutex<Option<String>>>,
-    waiters: Arc<Mutex<HashMap<u64, oneshot::Sender<SimToServer>>>>,
+    waiters: Arc<Mutex<HashMap<u64, (WaitKind, oneshot::Sender<SimToServer>)>>>,
     waiter_instance: Arc<Mutex<HashMap<u64, String>>>,
 }
 
@@ -168,6 +185,7 @@ impl InstanceMap {
             inbound,
             outbound_tx,
             read_mask: Vec::new(),
+            exclude_log_components: Vec::new(),
         };
         self.inner
             .lock()
@@ -322,6 +340,27 @@ impl InstanceMap {
             .map(|inst| inst.read_mask.clone())
     }
 
+    /// Store log components to drop at `push_inbound`.
+    pub fn set_exclude_log_components(&self, instance_id: &str, components: Vec<String>) {
+        if let Some(inst) = self
+            .inner
+            .lock()
+            .expect("instance map lock")
+            .get_mut(instance_id)
+        {
+            inst.exclude_log_components = components;
+        }
+    }
+
+    /// Current log-component exclude list, if the instance is connected.
+    pub fn exclude_log_components(&self, instance_id: &str) -> Option<Vec<String>> {
+        self.inner
+            .lock()
+            .expect("instance map lock")
+            .get(instance_id)
+            .map(|inst| inst.exclude_log_components.clone())
+    }
+
     /// `SimToServer` oneof name used by `SetSessionView.read_mask`.
     pub fn inbound_payload_name(msg: &SimToServer) -> Option<&'static str> {
         match msg.payload.as_ref() {
@@ -333,6 +372,7 @@ impl InstanceMap {
             Some(sim_to_server::Payload::InputAck(_)) => Some("input_ack"),
             Some(sim_to_server::Payload::InputObserved(_)) => Some("input_observed"),
             Some(sim_to_server::Payload::Goodbye(_)) => Some("goodbye"),
+            Some(sim_to_server::Payload::UiResult(_)) => Some("ui_result"),
             None => None,
         }
     }
@@ -369,12 +409,84 @@ impl InstanceMap {
             if !Self::inbound_visible(&inst.read_mask, &msg) {
                 return;
             }
+            if let Some(sim_to_server::Payload::Log(log)) = &msg.payload
+                && inst
+                    .exclude_log_components
+                    .iter()
+                    .any(|component| component == &log.component)
+            {
+                return;
+            }
             inst.inbound.push(msg);
         }
     }
 
     fn is_heartbeat(msg: &SimToServer) -> bool {
         matches!(msg.payload, Some(sim_to_server::Payload::Heartbeat(_)))
+    }
+
+    fn is_never_drop(msg: &SimToServer) -> bool {
+        match &msg.payload {
+            Some(sim_to_server::Payload::InputAck(_))
+            | Some(sim_to_server::Payload::UiResult(_))
+            | Some(sim_to_server::Payload::Snapshot(_))
+            | Some(sim_to_server::Payload::SnapshotError(_)) => true,
+            Some(sim_to_server::Payload::Log(log))
+                if log.component == "ACT" || log.component == "ERS" =>
+            {
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn eviction_rank(msg: &SimToServer) -> u8 {
+        match &msg.payload {
+            Some(sim_to_server::Payload::Heartbeat(_)) => 4,
+            Some(sim_to_server::Payload::Log(log))
+                if log.component == "MEM" || log.component == "SCT" =>
+            {
+                3
+            }
+            Some(sim_to_server::Payload::Log(log))
+                if log.component == "ACT" || log.component == "ERS" =>
+            {
+                0
+            }
+            Some(sim_to_server::Payload::Log(_)) => 2,
+            _ if !Self::is_never_drop(msg) => 1,
+            _ => 0,
+        }
+    }
+
+    fn eviction_index<'a, I>(items: I) -> Option<usize>
+    where
+        I: Iterator<Item = &'a SimToServer>,
+    {
+        items
+            .enumerate()
+            .filter(|(_, msg)| Self::eviction_rank(msg) > 0)
+            .max_by_key(|(index, msg)| (Self::eviction_rank(msg), usize::MAX - index))
+            .map(|(index, _)| index)
+    }
+
+    fn waiter_matches(kind: WaitKind, msg: &SimToServer) -> bool {
+        match kind {
+            WaitKind::Any => true,
+            WaitKind::InputAck => {
+                matches!(msg.payload, Some(sim_to_server::Payload::InputAck(_)))
+            }
+            WaitKind::UiResult => match &msg.payload {
+                Some(sim_to_server::Payload::UiResult(_)) => true,
+                Some(sim_to_server::Payload::InputAck(ack)) if !ack.accepted => true,
+                _ => false,
+            },
+            WaitKind::Snapshot => matches!(
+                msg.payload,
+                Some(sim_to_server::Payload::Snapshot(_))
+                    | Some(sim_to_server::Payload::SnapshotError(_))
+            ),
+        }
     }
 
     /// Enqueue `msg` and wait for a corr-matched inbound reply.
@@ -384,11 +496,23 @@ impl InstanceMap {
         msg: ServerToSim,
         timeout: Duration,
     ) -> Result<SimToServer, WaitError> {
+        self.send_and_wait_for(instance_id, msg, timeout, WaitKind::Any)
+            .await
+    }
+
+    /// Enqueue `msg` and wait for a corr-matched inbound of `kind`.
+    pub async fn send_and_wait_for(
+        &self,
+        instance_id: &str,
+        msg: ServerToSim,
+        timeout: Duration,
+        kind: WaitKind,
+    ) -> Result<SimToServer, WaitError> {
         if self.get(instance_id).is_none() {
             return Err(WaitError::UnknownInstance);
         }
         let corr = msg.corr;
-        let rx = self.register_waiter(instance_id, corr);
+        let rx = self.register_waiter(instance_id, corr, kind);
         match self.try_send(instance_id, msg) {
             Ok(()) => {}
             Err(TrySendError::UnknownInstance) => {
@@ -410,9 +534,17 @@ impl InstanceMap {
         }
     }
 
-    fn register_waiter(&self, instance_id: &str, corr: u64) -> oneshot::Receiver<SimToServer> {
+    fn register_waiter(
+        &self,
+        instance_id: &str,
+        corr: u64,
+        kind: WaitKind,
+    ) -> oneshot::Receiver<SimToServer> {
         let (tx, rx) = oneshot::channel();
-        self.waiters.lock().expect("waiters lock").insert(corr, tx);
+        self.waiters
+            .lock()
+            .expect("waiters lock")
+            .insert(corr, (kind, tx));
         self.waiter_instance
             .lock()
             .expect("waiter instance lock")
@@ -425,14 +557,33 @@ impl InstanceMap {
             .lock()
             .expect("waiter instance lock")
             .remove(&corr);
-        self.waiters.lock().expect("waiters lock").remove(&corr)
+        self.waiters
+            .lock()
+            .expect("waiters lock")
+            .remove(&corr)
+            .map(|(_, tx)| tx)
     }
 
     fn complete_waiter(&self, msg: &SimToServer) {
         if msg.corr == 0 {
             return;
         }
-        if let Some(tx) = self.take_waiter(msg.corr) {
+        let tx = {
+            let mut waiters = self.waiters.lock().expect("waiters lock");
+            let matches = waiters
+                .get(&msg.corr)
+                .is_some_and(|(kind, _)| Self::waiter_matches(*kind, msg));
+            if matches {
+                waiters.remove(&msg.corr).map(|(_, tx)| tx)
+            } else {
+                None
+            }
+        };
+        if let Some(tx) = tx {
+            self.waiter_instance
+                .lock()
+                .expect("waiter instance lock")
+                .remove(&msg.corr);
             let _ = tx.send(msg.clone());
         }
     }
@@ -470,6 +621,7 @@ mod tests {
     use super::*;
     use csm_pb_bindings::generated::crosspoint::sim::control::v1alpha1::{
         Goodbye, InputAck, InputObserved, LogLine, ShutdownRequest, SnapshotError, SnapshotFrame,
+        UiResult,
     };
 
     fn register(id: &str) -> Register {
@@ -574,10 +726,15 @@ mod tests {
     }
 
     fn log_line(seq: u64, text: &str) -> SimToServer {
+        log_component(seq, "", text)
+    }
+
+    fn log_component(seq: u64, component: &str, text: &str) -> SimToServer {
         SimToServer {
             seq,
             payload: Some(
                 LogLine {
+                    component: component.into(),
                     text: text.into(),
                     ..Default::default()
                 }
@@ -884,6 +1041,13 @@ mod tests {
                 },
                 "goodbye",
             ),
+            (
+                SimToServer {
+                    payload: Some(UiResult::default().into()),
+                    ..Default::default()
+                },
+                "ui_result",
+            ),
         ];
         for (msg, name) in named {
             assert_eq!(InstanceMap::inbound_payload_name(&msg), Some(name));
@@ -895,5 +1059,133 @@ mod tests {
         assert_eq!(InstanceMap::inbound_payload_name(&empty), None);
         assert!(InstanceMap::inbound_visible(&[], &empty));
         assert!(!InstanceMap::inbound_visible(&["log".into()], &empty));
+    }
+
+    #[test]
+    fn inbound_never_drops_act_ers_or_acks() {
+        let map = InstanceMap::new();
+        let (tx, _rx) = mpsc::channel(1);
+        let (_token, sink) = map.insert(register("q"), 4, tx);
+        sink.push(log_component(1, "MEM", "heap"));
+        sink.push(log_component(2, "SCT", "index"));
+        sink.push(log_component(3, "MEM", "heap2"));
+        sink.push(log_component(4, "SCT", "index2"));
+        sink.push(log_component(5, "ACT", "Entering activity: Home"));
+        sink.push(log_component(6, "ERS", "Rendered page"));
+        sink.push(SimToServer {
+            seq: 7,
+            payload: Some(InputAck::default().into()),
+            ..Default::default()
+        });
+        sink.push(SimToServer {
+            seq: 8,
+            payload: Some(UiResult::default().into()),
+            ..Default::default()
+        });
+        let kept: Vec<u64> = std::iter::from_fn(|| map.try_recv_inbound("q").map(|msg| msg.seq))
+            .collect();
+        assert_eq!(kept, vec![5, 6, 7, 8], "{kept:?}");
+    }
+
+    #[test]
+    fn push_inbound_drops_excluded_log_components() {
+        let map = InstanceMap::new();
+        insert_id(&map, "a");
+        map.set_exclude_log_components("a", vec!["MEM".into()]);
+        map.push_inbound("a", log_component(1, "MEM", "heap"));
+        map.push_inbound("a", log_component(2, "ACT", "Entering activity: Home"));
+        let got = map.try_recv_inbound("a").unwrap();
+        assert_eq!(got.seq, 2);
+        assert!(map.try_recv_inbound("a").is_none());
+    }
+
+    #[tokio::test]
+    async fn send_and_wait_for_ui_result_ignores_accepted_ack() {
+        let map = InstanceMap::new();
+        let (tx, _rx) = mpsc::channel(4);
+        map.insert(register("a"), 4, tx);
+        let corr = map.next_corr();
+        let wait = map.send_and_wait_for("a", outbound(corr), REPLY_TIMEOUT, WaitKind::UiResult);
+        tokio::pin!(wait);
+        map.push_inbound(
+            "a",
+            SimToServer {
+                corr,
+                payload: Some(
+                    InputAck {
+                        accepted: true,
+                        ..Default::default()
+                    }
+                    .into(),
+                ),
+                ..Default::default()
+            },
+        );
+        assert!(matches!(
+            futures::poll!(&mut wait),
+            std::task::Poll::Pending
+        ));
+        map.push_inbound(
+            "a",
+            SimToServer {
+                corr,
+                payload: Some(
+                    UiResult {
+                        painted: true,
+                        generation: 9,
+                        activity: "Home".into(),
+                        ..Default::default()
+                    }
+                    .into(),
+                ),
+                ..Default::default()
+            },
+        );
+        let reply = wait.await.unwrap();
+        match reply.payload {
+            Some(sim_to_server::Payload::UiResult(result)) => {
+                assert!(result.painted);
+                assert_eq!(result.generation, 9);
+                assert_eq!(result.activity, "Home");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn send_and_wait_for_ui_result_fails_fast_on_rejected_ack() {
+        let map = InstanceMap::new();
+        let (tx, _rx) = mpsc::channel(4);
+        map.insert(register("a"), 4, tx);
+        let corr = map.next_corr();
+        let wait = map.send_and_wait_for("a", outbound(corr), REPLY_TIMEOUT, WaitKind::UiResult);
+        tokio::pin!(wait);
+        assert!(matches!(
+            futures::poll!(&mut wait),
+            std::task::Poll::Pending
+        ));
+        map.push_inbound(
+            "a",
+            SimToServer {
+                corr,
+                payload: Some(
+                    InputAck {
+                        accepted: false,
+                        reason: "no_touch".into(),
+                        ..Default::default()
+                    }
+                    .into(),
+                ),
+                ..Default::default()
+            },
+        );
+        let reply = wait.await.unwrap();
+        match reply.payload {
+            Some(sim_to_server::Payload::InputAck(ack)) => {
+                assert!(!ack.accepted);
+                assert_eq!(ack.reason, "no_touch");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }

@@ -9,8 +9,8 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use buffa_types::google::protobuf::FieldMask;
 use csm_pb_bindings::generated::crosspoint::sim::control::v1alpha1::{
-    InjectHome, InjectKey, InjectSwipe, InjectTouch, ServerToSim, SetInjectEnabled, SetSessionView,
-    ShutdownRequest, SnapshotRequest, sim_to_server,
+    CoordinateSpace, InjectHome, InjectKey, InjectSwipe, InjectTouch, ServerToSim,
+    SetInjectEnabled, SetSessionView, ShutdownRequest, SnapshotRequest, sim_to_server,
 };
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -31,7 +31,7 @@ use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
 use crate::instances::{
-    InstanceMap, InstanceSnapshot, REPLY_TIMEOUT, ResolveError, TrySendError, WaitError,
+    InstanceMap, InstanceSnapshot, REPLY_TIMEOUT, ResolveError, TrySendError, WaitError, WaitKind,
 };
 use crate::spawn::{SpawnConfig, SpawnError, SpawnSupervisor};
 
@@ -54,14 +54,19 @@ or --auto-sleep / CSM_AUTO_SLEEP) seeds fs_/.crosspoint/settings.json with \
 sleepTimeoutMinutes 31 (never); pass true to keep firmware's 10-minute idle sleep. \
 Use list_instances and \
 get_instance to see connected peers. inject_touch, \
-inject_key, inject_home, and inject_swipe wait for InputAck unless wait is false. \
-request_snapshot waits for a PNG SnapshotFrame. observe drains inbound events including \
-human and remote InputObserved. Pass until_log and/or until_generation_gt to wait; \
-wait_ms overrides the process default (--observe-wait-ms / CSM_OBSERVE_WAIT_MS, 8000). \
+inject_key, inject_home, and inject_swipe wait for UiResult (wait_mode=paint) unless \
+wait is false or wait_mode=ack. Touch and swipe coordinates default to logical pixels; \
+pass space=panel for framebuffer pixels. inject_batch runs those injects sequentially \
+and stops on the first rejection. request_snapshot waits for a PNG SnapshotFrame. \
+observe drains inbound events including human and remote InputObserved. It always \
+echoes generation, activity, readerPage, and readerSpine from lastHeartbeat. \
+Pass until_log, until_activity, until_progress_page, and/or until_generation_gt \
+to wait; until_generation_gt 0 means the current lastHeartbeat.framebufferGeneration (wait for a bump). \
+matched and timedOut are omitted unless an until-condition was set. wait_ms \
+overrides the process default (--observe-wait-ms / CSM_OBSERVE_WAIT_MS, 8000). \
 A non-empty set_session_view still receives heartbeats so get_instance.lastHeartbeat \
 and until_generation_gt keep working; observe omits them unless heartbeat is in the mask. \
-InputAck means the inject was queued, not that the panel \
-painted; after inject, observe for ACT/ERS/GFX logs or a framebufferGeneration bump. \
+exclude_log_components (for example MEM, SCT) drops those LogLine components. \
 Do not sleep as synchronization. Tap (inject_touch) when Register.capTouch is true; \
 default X4 has no touch and no Home. shutdown_instance sends ShutdownRequest and reaps a child \
 this server started. Read csm://capabilities for the machine-readable surface. \
@@ -76,6 +81,7 @@ pub const TOOL_NAMES: &[&str] = &[
     "inject_key",
     "inject_home",
     "inject_swipe",
+    "inject_batch",
     "set_inject_enabled",
     "request_snapshot",
     "set_session_view",
@@ -151,8 +157,22 @@ impl McpServer {
                 "waitMsParam": "wait_ms",
                 "waitMsDefault": crate::spawn::DEFAULT_OBSERVE_WAIT_MS,
                 "untilLogParam": "until_log",
+                "untilActivityParam": "until_activity",
+                "untilProgressPageParam": "until_progress_page",
                 "untilGenerationGtParam": "until_generation_gt",
+                "untilGenerationGtZeroMeansCurrent": true,
+                "matchedOnlyWithUntil": true,
                 "heartbeatAlwaysOnWire": true,
+            },
+            "inject": {
+                "waitModeDefault": "paint",
+                "waitModes": ["ack", "paint"],
+                "coordinateSpaceDefault": "logical",
+                "coordinateSpaces": ["panel", "logical"],
+                "batchTool": "inject_batch",
+            },
+            "sessionView": {
+                "excludeLogComponentsParam": "exclude_log_components",
             },
             "firmware": {
                 "compileTime": true,
@@ -220,6 +240,8 @@ impl McpServer {
         payload: impl Into<
             csm_pb_bindings::generated::crosspoint::sim::control::v1alpha1::server_to_sim::Payload,
         >,
+        kind: WaitKind,
+        timeout: Duration,
     ) -> Result<
         (
             String,
@@ -239,7 +261,7 @@ impl McpServer {
         };
         let reply = self
             .instances
-            .send_and_wait(&id, msg, REPLY_TIMEOUT)
+            .send_and_wait_for(&id, msg, timeout, kind)
             .await
             .map_err(|err| match err {
                 WaitError::UnknownInstance => "unknown instance".to_string(),
@@ -254,6 +276,8 @@ impl McpServer {
         &self,
         instance_id: Option<&str>,
         wait: bool,
+        wait_mode: Option<&str>,
+        wait_ms: Option<u32>,
         payload: impl Into<
             csm_pb_bindings::generated::crosspoint::sim::control::v1alpha1::server_to_sim::Payload,
         >,
@@ -261,14 +285,32 @@ impl McpServer {
         if !wait {
             return self.enqueue(instance_id, false, payload);
         }
-        let (id, corr, reply) = self.enqueue_wait(instance_id, true, payload).await?;
+        let kind = inject_wait_kind(wait_mode)?;
+        let timeout = wait_ms
+            .map(|ms| Duration::from_millis(u64::from(ms)))
+            .unwrap_or(REPLY_TIMEOUT);
+        let (id, corr, reply) = self
+            .enqueue_wait(instance_id, true, payload, kind, timeout)
+            .await?;
         match reply.payload {
+            Some(sim_to_server::Payload::UiResult(result)) => Ok(json!({
+                "accepted": true,
+                "painted": result.painted,
+                "generation": result.generation,
+                "activity": result.activity,
+                "instanceId": id,
+                "corr": corr,
+            })),
             Some(sim_to_server::Payload::InputAck(ack)) => {
                 if ack.accepted {
+                    let snap = self.instances.get(&id);
+                    let hb = snap.as_ref().and_then(|s| s.last_heartbeat.as_ref());
                     Ok(json!({
                         "accepted": true,
                         "instanceId": id,
                         "corr": corr,
+                        "generation": hb.map(|h| h.framebuffer_generation),
+                        "activity": hb.map(|h| h.activity.as_str()).unwrap_or(""),
                     }))
                 } else {
                     let reason = if ack.reason.is_empty() {
@@ -317,13 +359,10 @@ impl McpServer {
     pub fn observe_json(&self, instance_id: Option<&str>) -> Result<Value, String> {
         let (id, events) = self.drain_observe(instance_id)?;
         tracing::debug!(instance_id = %id, events = events.len(), "observe drain");
-        Ok(json!({
-            "instanceId": id,
-            "events": events,
-        }))
+        Ok(self.observe_result(&id, events, false, false, false))
     }
 
-    /// Drain, optionally waiting for a log substring and/or a generation bump.
+    /// Drain, optionally waiting for until-conditions.
     ///
     /// Succeeds when any specified until-condition matches. `wait_ms` `0` or
     /// omitted with no until-condition is a one-shot drain. Omitted `wait_ms`
@@ -331,27 +370,43 @@ impl McpServer {
     pub async fn observe_wait_json(
         &self,
         instance_id: Option<&str>,
-        wait_ms: Option<u32>,
-        until_log: Option<&str>,
-        until_generation_gt: Option<u64>,
+        spec: ObserveSpec<'_>,
     ) -> Result<Value, String> {
-        let until_log = until_log.filter(|text| !text.is_empty());
-        let waiting = until_log.is_some() || until_generation_gt.is_some();
-        let timeout_ms = match wait_ms {
+        let until_log = spec.until_log.filter(|text| !text.is_empty());
+        let until_activity = spec.until_activity.filter(|text| !text.is_empty());
+        let waiting = until_log.is_some()
+            || spec.until_generation_gt.is_some()
+            || until_activity.is_some()
+            || spec.until_progress_page.is_some();
+        let timeout_ms = match spec.wait_ms {
             Some(ms) => ms,
             None if waiting => self.spawn.observe_wait_ms(),
             None => 0,
         };
         let (id, mut events) = self.drain_observe(instance_id)?;
+        let generation_floor = match spec.until_generation_gt {
+            Some(0) => Some(
+                self.instances
+                    .get(&id)
+                    .and_then(|snap| snap.last_heartbeat)
+                    .map(|hb| hb.framebuffer_generation)
+                    .unwrap_or(0),
+            ),
+            other => other,
+        };
         let deadline = Instant::now() + Duration::from_millis(u64::from(timeout_ms));
         loop {
-            let generation = self.instances.get(&id).and_then(|snap| {
-                snap.last_heartbeat
-                    .as_ref()
-                    .map(|hb| hb.framebuffer_generation)
-            });
-            let matched =
-                observe_until_matched(until_log, until_generation_gt, &events, generation);
+            let ui = self.heartbeat_ui(&id);
+            let matched = observe_until_matched(
+                until_log,
+                generation_floor,
+                until_activity,
+                spec.until_progress_page,
+                &events,
+                ui.generation,
+                ui.activity.as_str(),
+                ui.reader_page,
+            );
             let timed_out = Instant::now() >= deadline;
             if (waiting && (matched || timed_out)) || (!waiting && timed_out) {
                 tracing::debug!(
@@ -361,16 +416,51 @@ impl McpServer {
                     waiting,
                     "observe wait"
                 );
-                return Ok(json!({
-                    "instanceId": id,
-                    "events": events,
-                    "matched": matched,
-                    "timedOut": waiting && !matched,
-                }));
+                return Ok(self.observe_result(&id, events, waiting, matched, waiting && !matched));
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
             events.extend(self.drain_observe(Some(&id))?.1);
         }
+    }
+
+    fn heartbeat_ui(&self, instance_id: &str) -> HeartbeatUi {
+        match self
+            .instances
+            .get(instance_id)
+            .and_then(|snap| snap.last_heartbeat)
+        {
+            Some(hb) => HeartbeatUi {
+                generation: Some(hb.framebuffer_generation),
+                activity: hb.activity,
+                reader_spine: hb.reader_spine,
+                reader_page: hb.reader_page,
+            },
+            None => HeartbeatUi::default(),
+        }
+    }
+
+    fn observe_result(
+        &self,
+        instance_id: &str,
+        events: Vec<Value>,
+        include_until: bool,
+        matched: bool,
+        timed_out: bool,
+    ) -> Value {
+        let ui = self.heartbeat_ui(instance_id);
+        let mut body = json!({
+            "instanceId": instance_id,
+            "events": events,
+            "generation": ui.generation,
+            "activity": ui.activity,
+            "readerPage": ui.reader_page,
+            "readerSpine": ui.reader_spine,
+        });
+        if include_until {
+            body["matched"] = json!(matched);
+            body["timedOut"] = json!(timed_out);
+        }
+        body
     }
 
     fn drain_observe(&self, instance_id: Option<&str>) -> Result<(String, Vec<Value>), String> {
@@ -386,7 +476,7 @@ impl McpServer {
         Ok((id, events))
     }
 
-    /// Inject a touch edge. When `wait` is true, wait for `InputAck`.
+    /// Inject a touch edge. Default wait is paint (`UiResult`); coordinates default to logical.
     pub async fn inject_touch_json(
         &self,
         instance_id: Option<&str>,
@@ -394,31 +484,41 @@ impl McpServer {
         x: u32,
         y: u32,
         wait: bool,
+        wait_mode: Option<&str>,
+        space: Option<&str>,
+        wait_ms: Option<u32>,
     ) -> Result<Value, String> {
         self.inject(
             instance_id,
             wait,
+            wait_mode,
+            wait_ms,
             InjectTouch {
                 kind,
                 x,
                 y,
+                coordinate_space: parse_coordinate_space(space)?.into(),
                 ..Default::default()
             },
         )
         .await
     }
 
-    /// Inject a named key. When `wait` is true, wait for `InputAck`.
+    /// Inject a named key. Default wait is paint (`UiResult`).
     pub async fn inject_key_json(
         &self,
         instance_id: Option<&str>,
         name: String,
         hold_ms: u32,
         wait: bool,
+        wait_mode: Option<&str>,
+        wait_ms: Option<u32>,
     ) -> Result<Value, String> {
         self.inject(
             instance_id,
             wait,
+            wait_mode,
+            wait_ms,
             InjectKey {
                 name,
                 hold_ms,
@@ -428,16 +528,20 @@ impl McpServer {
         .await
     }
 
-    /// Inject Home. When `wait` is true, wait for `InputAck`.
+    /// Inject Home. Default wait is paint (`UiResult`).
     pub async fn inject_home_json(
         &self,
         instance_id: Option<&str>,
         hold_ms: u32,
         wait: bool,
+        wait_mode: Option<&str>,
+        wait_ms: Option<u32>,
     ) -> Result<Value, String> {
         self.inject(
             instance_id,
             wait,
+            wait_mode,
+            wait_ms,
             InjectHome {
                 hold_ms,
                 ..Default::default()
@@ -446,7 +550,7 @@ impl McpServer {
         .await
     }
 
-    /// Inject a swipe. When `wait` is true, wait for `InputAck`.
+    /// Inject a swipe. Default wait is paint (`UiResult`); coordinates default to logical.
     pub async fn inject_swipe_json(
         &self,
         instance_id: Option<&str>,
@@ -456,20 +560,112 @@ impl McpServer {
         end_y: u32,
         duration_ms: u32,
         wait: bool,
+        wait_mode: Option<&str>,
+        space: Option<&str>,
+        wait_ms: Option<u32>,
     ) -> Result<Value, String> {
+        let space = parse_coordinate_space(space)?;
         self.inject(
             instance_id,
             wait,
+            wait_mode,
+            wait_ms,
             InjectSwipe {
                 start_x,
                 start_y,
                 end_x,
                 end_y,
                 duration_ms,
+                coordinate_space: space.into(),
                 ..Default::default()
             },
         )
         .await
+    }
+
+    /// Run inject steps sequentially. Stops on the first rejection.
+    pub async fn inject_batch_json(
+        &self,
+        instance_id: Option<&str>,
+        wait: bool,
+        wait_mode: Option<&str>,
+        space: Option<&str>,
+        wait_ms: Option<u32>,
+        steps: &[InjectBatchStep],
+    ) -> Result<Value, String> {
+        let snap = self.resolve(instance_id)?;
+        let id = snap.register.instance_id;
+        let mut results = Vec::new();
+        for (index, step) in steps.iter().enumerate() {
+            let step_wait = step.wait.unwrap_or(wait);
+            let step_mode = step.wait_mode.as_deref().or(wait_mode);
+            let step_space = step.space.as_deref().or(space);
+            let step_wait_ms = step.wait_ms.or(wait_ms);
+            let result = match step.kind.as_str() {
+                "touch" => {
+                    self.inject_touch_json(
+                        Some(&id),
+                        step.touch_kind.unwrap_or(3),
+                        step.x,
+                        step.y,
+                        step_wait,
+                        step_mode,
+                        step_space,
+                        step_wait_ms,
+                    )
+                    .await
+                }
+                "key" => {
+                    self.inject_key_json(
+                        Some(&id),
+                        step.name.clone().unwrap_or_default(),
+                        step.hold_ms,
+                        step_wait,
+                        step_mode,
+                        step_wait_ms,
+                    )
+                    .await
+                }
+                "home" => {
+                    self.inject_home_json(Some(&id), step.hold_ms, step_wait, step_mode, step_wait_ms)
+                        .await
+                }
+                "swipe" => {
+                    self.inject_swipe_json(
+                        Some(&id),
+                        step.start_x,
+                        step.start_y,
+                        step.end_x,
+                        step.end_y,
+                        step.duration_ms,
+                        step_wait,
+                        step_mode,
+                        step_space,
+                        step_wait_ms,
+                    )
+                    .await
+                }
+                other => Err(format!("unknown inject_batch step kind: {other}")),
+            };
+            match result {
+                Ok(value) => results.push(json!({ "index": index, "result": value })),
+                Err(error) => {
+                    results.push(json!({ "index": index, "error": error }));
+                    return Ok(json!({
+                        "instanceId": id,
+                        "stopped": true,
+                        "failedIndex": index,
+                        "error": error,
+                        "results": results,
+                    }));
+                }
+            }
+        }
+        Ok(json!({
+            "instanceId": id,
+            "stopped": false,
+            "results": results,
+        }))
     }
 
     /// Enqueue inject-enabled.
@@ -512,7 +708,16 @@ impl McpServer {
         if !wait {
             return Self::tool_result(self.enqueue(instance_id, false, payload));
         }
-        match self.enqueue_wait(instance_id, false, payload).await {
+        match self
+            .enqueue_wait(
+                instance_id,
+                false,
+                payload,
+                WaitKind::Snapshot,
+                REPLY_TIMEOUT,
+            )
+            .await
+        {
             Ok((id, corr, reply)) => match reply.payload {
                 Some(sim_to_server::Payload::Snapshot(frame)) => {
                     let mime = if frame.mime_type.is_empty() {
@@ -556,6 +761,7 @@ impl McpServer {
         &self,
         instance_id: Option<&str>,
         paths: Vec<String>,
+        exclude_log_components: Vec<String>,
     ) -> Result<Value, String> {
         let snap = self.resolve(instance_id)?;
         let id = snap.register.instance_id;
@@ -568,10 +774,13 @@ impl McpServer {
                     ..Default::default()
                 }
                 .into(),
+                exclude_log_components: exclude_log_components.clone(),
                 ..Default::default()
             },
         )?;
         self.instances.set_read_mask(&id, paths);
+        self.instances
+            .set_exclude_log_components(&id, exclude_log_components);
         Ok(queued)
     }
 
@@ -707,23 +916,60 @@ fn wire_session_view_paths(paths: &[String]) -> Vec<String> {
     wire
 }
 
+#[derive(Clone, Debug, Default)]
+struct HeartbeatUi {
+    generation: Option<u64>,
+    activity: String,
+    reader_spine: i32,
+    reader_page: i32,
+}
+
+/// Until-conditions and timeout for [`McpServer::observe_wait_json`].
+#[derive(Clone, Debug, Default)]
+pub struct ObserveSpec<'a> {
+    /// Miss ceiling in milliseconds.
+    pub wait_ms: Option<u32>,
+    /// Substring of drained `log.text`.
+    pub until_log: Option<&'a str>,
+    /// Wait until `framebufferGeneration` is greater than this. `0` is current.
+    pub until_generation_gt: Option<u64>,
+    /// Exact `Heartbeat.activity`, or `Entering activity: {name}` in logs.
+    pub until_activity: Option<&'a str>,
+    /// `Heartbeat.reader_page`, or `page=N` on a `Progress saved` line.
+    pub until_progress_page: Option<i32>,
+}
+
+fn inject_wait_kind(wait_mode: Option<&str>) -> Result<WaitKind, String> {
+    match wait_mode.unwrap_or("paint") {
+        "paint" => Ok(WaitKind::UiResult),
+        "ack" => Ok(WaitKind::Any),
+        other => Err(format!("unknown wait_mode: {other}")),
+    }
+}
+
+fn parse_coordinate_space(space: Option<&str>) -> Result<CoordinateSpace, String> {
+    match space.unwrap_or("logical") {
+        "logical" => Ok(CoordinateSpace::Logical),
+        "panel" => Ok(CoordinateSpace::Panel),
+        other => Err(format!("unknown coordinate_space: {other}")),
+    }
+}
+
 fn observe_until_matched(
     until_log: Option<&str>,
     until_generation_gt: Option<u64>,
+    until_activity: Option<&str>,
+    until_progress_page: Option<i32>,
     events: &[Value],
     generation: Option<u64>,
+    activity: &str,
+    reader_page: i32,
 ) -> bool {
     let mut any = false;
     let mut hit = false;
     if let Some(needle) = until_log {
         any = true;
-        if events.iter().any(|event| {
-            event
-                .get("log")
-                .and_then(|log| log.get("text"))
-                .and_then(Value::as_str)
-                .is_some_and(|text| text.contains(needle))
-        }) {
+        if events.iter().any(|event| log_text(event).contains(needle)) {
             hit = true;
         }
     }
@@ -733,7 +979,45 @@ fn observe_until_matched(
             hit = true;
         }
     }
+    if let Some(name) = until_activity {
+        any = true;
+        if activity == name
+            || events
+                .iter()
+                .any(|event| log_text(event).contains(&format!("Entering activity: {name}")))
+        {
+            hit = true;
+        }
+    }
+    if let Some(page) = until_progress_page {
+        any = true;
+        if reader_page == page
+            || events.iter().any(|event| {
+                let text = log_text(event);
+                text.contains("Progress saved:") && tagged_i32(text, "page=") == Some(page)
+            })
+        {
+            hit = true;
+        }
+    }
     !any || hit
+}
+
+fn log_text(event: &Value) -> &str {
+    event
+        .get("log")
+        .and_then(|log| log.get("text"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+}
+
+fn tagged_i32(text: &str, tag: &str) -> Option<i32> {
+    let rest = text.split(tag).nth(1)?;
+    let digits: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '-')
+        .collect();
+    digits.parse().ok()
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -750,13 +1034,22 @@ struct InjectTouchParams {
     instance_id: Option<String>,
     /// 0=down, 1=move, 2=up, 3=tap.
     kind: u32,
-    /// Touch x in panel pixels.
+    /// Touch x in `space` pixels.
     x: u32,
-    /// Touch y in panel pixels.
+    /// Touch y in `space` pixels.
     y: u32,
-    /// When true (default), wait for InputAck.
+    /// When true (default), wait for UiResult (paint) or InputAck (ack).
     #[serde(default = "default_wait")]
     wait: bool,
+    /// `paint` (default) waits for UiResult; `ack` waits for InputAck.
+    #[serde(default)]
+    wait_mode: Option<String>,
+    /// `logical` (default) or `panel`.
+    #[serde(default)]
+    space: Option<String>,
+    /// Wait timeout in milliseconds. Omitted uses the 2s session reply timeout.
+    #[serde(default)]
+    wait_ms: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -769,9 +1062,15 @@ struct InjectKeyParams {
     /// Hold duration in milliseconds; 0 means the default 80.
     #[serde(default)]
     hold_ms: u32,
-    /// When true (default), wait for InputAck.
+    /// When true (default), wait for UiResult (paint) or InputAck (ack).
     #[serde(default = "default_wait")]
     wait: bool,
+    /// `paint` (default) waits for UiResult; `ack` waits for InputAck.
+    #[serde(default)]
+    wait_mode: Option<String>,
+    /// Wait timeout in milliseconds. Omitted uses the 2s session reply timeout.
+    #[serde(default)]
+    wait_ms: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -782,9 +1081,15 @@ struct InjectHomeParams {
     /// Hold duration in milliseconds.
     #[serde(default)]
     hold_ms: u32,
-    /// When true (default), wait for InputAck.
+    /// When true (default), wait for UiResult (paint) or InputAck (ack).
     #[serde(default = "default_wait")]
     wait: bool,
+    /// `paint` (default) waits for UiResult; `ack` waits for InputAck.
+    #[serde(default)]
+    wait_mode: Option<String>,
+    /// Wait timeout in milliseconds. Omitted uses the 2s session reply timeout.
+    #[serde(default)]
+    wait_ms: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -792,20 +1097,29 @@ struct InjectSwipeParams {
     /// Instance id (1–64 bytes). Required unless `--default-instance` is set.
     #[serde(default)]
     instance_id: Option<String>,
-    /// Start x in panel pixels.
+    /// Start x in `space` pixels.
     start_x: u32,
-    /// Start y in panel pixels.
+    /// Start y in `space` pixels.
     start_y: u32,
-    /// End x in panel pixels.
+    /// End x in `space` pixels.
     end_x: u32,
-    /// End y in panel pixels.
+    /// End y in `space` pixels.
     end_y: u32,
     /// Duration of the swipe in milliseconds.
     #[serde(default)]
     duration_ms: u32,
-    /// When true (default), wait for InputAck.
+    /// When true (default), wait for UiResult (paint) or InputAck (ack).
     #[serde(default = "default_wait")]
     wait: bool,
+    /// `paint` (default) waits for UiResult; `ack` waits for InputAck.
+    #[serde(default)]
+    wait_mode: Option<String>,
+    /// `logical` (default) or `panel`.
+    #[serde(default)]
+    space: Option<String>,
+    /// Wait timeout in milliseconds. Omitted uses the 2s session reply timeout.
+    #[serde(default)]
+    wait_ms: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -853,6 +1167,9 @@ struct SessionViewParams {
     /// SimToServer payload names (register, heartbeat, snapshot, log, input_observed, …).
     #[serde(default)]
     paths: Vec<String>,
+    /// Firmware log `component` names to omit (for example MEM or SCT).
+    #[serde(default)]
+    exclude_log_components: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -889,8 +1206,86 @@ struct ObserveParams {
     #[serde(default)]
     until_log: Option<String>,
     /// Succeed when `lastHeartbeat.framebufferGeneration` is greater than this.
+    /// `0` means the current generation (wait for a bump).
     #[serde(default)]
     until_generation_gt: Option<u64>,
+    /// Succeed when Heartbeat.activity equals this, or a drained log contains
+    /// `Entering activity: {name}`.
+    #[serde(default)]
+    until_activity: Option<String>,
+    /// Succeed when Heartbeat.reader_page equals this, or a drained
+    /// `Progress saved` line reports `page=N`.
+    #[serde(default)]
+    until_progress_page: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct InjectBatchParams {
+    /// Instance id (1–64 bytes). Required unless `--default-instance` is set.
+    #[serde(default)]
+    instance_id: Option<String>,
+    /// Shared wait. When true (default), each step waits.
+    #[serde(default = "default_wait")]
+    wait: bool,
+    /// Shared `paint` (default) or `ack`. A step may override.
+    #[serde(default)]
+    wait_mode: Option<String>,
+    /// Shared `logical` (default) or `panel` for touch/swipe steps.
+    #[serde(default)]
+    space: Option<String>,
+    /// Shared wait timeout in milliseconds.
+    #[serde(default)]
+    wait_ms: Option<u32>,
+    /// Sequential inject steps (`touch`, `key`, `home`, `swipe`).
+    steps: Vec<InjectBatchStep>,
+}
+
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct InjectBatchStep {
+    /// `touch`, `key`, `home`, or `swipe`.
+    kind: String,
+    /// Touch x (touch steps).
+    #[serde(default)]
+    x: u32,
+    /// Touch y (touch steps).
+    #[serde(default)]
+    y: u32,
+    /// Touch kind; default 3 (tap).
+    #[serde(default)]
+    touch_kind: Option<u32>,
+    /// Key name (key steps).
+    #[serde(default)]
+    name: Option<String>,
+    /// Hold duration for key or home.
+    #[serde(default)]
+    hold_ms: u32,
+    /// Swipe start x.
+    #[serde(default)]
+    start_x: u32,
+    /// Swipe start y.
+    #[serde(default)]
+    start_y: u32,
+    /// Swipe end x.
+    #[serde(default)]
+    end_x: u32,
+    /// Swipe end y.
+    #[serde(default)]
+    end_y: u32,
+    /// Swipe duration in milliseconds.
+    #[serde(default)]
+    duration_ms: u32,
+    /// Per-step wait override.
+    #[serde(default)]
+    wait: Option<bool>,
+    /// Per-step wait_mode override.
+    #[serde(default)]
+    wait_mode: Option<String>,
+    /// Per-step coordinate space override.
+    #[serde(default)]
+    space: Option<String>,
+    /// Per-step wait timeout override.
+    #[serde(default)]
+    wait_ms: Option<u32>,
 }
 
 #[tool_router]
@@ -935,7 +1330,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Inject a touch edge or tap on the named instance; waits for InputAck unless wait is false"
+        description = "Inject a touch edge or tap. Coordinates default to logical pixels (space=panel for framebuffer). Waits for UiResult (wait_mode=paint) unless wait is false or wait_mode=ack."
     )]
     async fn inject_touch(
         &self,
@@ -948,13 +1343,16 @@ impl McpServer {
                 params.x,
                 params.y,
                 params.wait,
+                params.wait_mode.as_deref(),
+                params.space.as_deref(),
+                params.wait_ms,
             )
             .await,
         )
     }
 
     #[tool(
-        description = "Inject a named device key (BACK, ENTER, LEFT, RIGHT, UP, DOWN, POWER, SLEEP, QUIT) on the named instance; waits for InputAck unless wait is false"
+        description = "Inject a named device key (BACK, ENTER, LEFT, RIGHT, UP, DOWN, POWER, SLEEP, QUIT). Waits for UiResult (wait_mode=paint) unless wait is false or wait_mode=ack."
     )]
     async fn inject_key(
         &self,
@@ -966,26 +1364,34 @@ impl McpServer {
                 params.name,
                 params.hold_ms,
                 params.wait,
+                params.wait_mode.as_deref(),
+                params.wait_ms,
             )
             .await,
         )
     }
 
     #[tool(
-        description = "Inject the Home key on the named instance; waits for InputAck unless wait is false. Rejected when the board has no Home key."
+        description = "Inject the Home key. Waits for UiResult (wait_mode=paint) unless wait is false or wait_mode=ack. Rejected when the board has no Home key."
     )]
     async fn inject_home(
         &self,
         Parameters(params): Parameters<InjectHomeParams>,
     ) -> Result<CallToolResult, McpError> {
         Self::tool_result(
-            self.inject_home_json(params.instance_id.as_deref(), params.hold_ms, params.wait)
-                .await,
+            self.inject_home_json(
+                params.instance_id.as_deref(),
+                params.hold_ms,
+                params.wait,
+                params.wait_mode.as_deref(),
+                params.wait_ms,
+            )
+            .await,
         )
     }
 
     #[tool(
-        description = "Inject a swipe on the named instance; waits for InputAck unless wait is false. Rejected when the board has no touch."
+        description = "Inject a swipe. Coordinates default to logical pixels. Waits for UiResult (wait_mode=paint) unless wait is false or wait_mode=ack. Rejected when the board has no touch."
     )]
     async fn inject_swipe(
         &self,
@@ -1000,6 +1406,29 @@ impl McpServer {
                 params.end_y,
                 params.duration_ms,
                 params.wait,
+                params.wait_mode.as_deref(),
+                params.space.as_deref(),
+                params.wait_ms,
+            )
+            .await,
+        )
+    }
+
+    #[tool(
+        description = "Run inject_touch / inject_key / inject_home / inject_swipe steps sequentially. Shared instance_id and wait_mode; a step may override. Stops on the first rejection. Each paint-wait uses UiResult."
+    )]
+    async fn inject_batch(
+        &self,
+        Parameters(params): Parameters<InjectBatchParams>,
+    ) -> Result<CallToolResult, McpError> {
+        Self::tool_result(
+            self.inject_batch_json(
+                params.instance_id.as_deref(),
+                params.wait,
+                params.wait_mode.as_deref(),
+                params.space.as_deref(),
+                params.wait_ms,
+                &params.steps,
             )
             .await,
         )
@@ -1038,13 +1467,17 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Set which SimToServer payloads observe should emit (read_mask names: register, heartbeat, snapshot, snapshot_error, log, input_ack, input_observed, goodbye). Empty mask emits everything. A non-empty mask still receives heartbeats on the wire so lastHeartbeat advances."
+        description = "Set which SimToServer payloads observe should emit (read_mask names: register, heartbeat, snapshot, snapshot_error, log, input_ack, input_observed, goodbye, ui_result). Empty mask emits everything. exclude_log_components drops those firmware log components (MEM, SCT). A non-empty mask still receives heartbeats on the wire so lastHeartbeat advances."
     )]
     fn set_session_view(
         &self,
         Parameters(params): Parameters<SessionViewParams>,
     ) -> Result<CallToolResult, McpError> {
-        Self::tool_result(self.set_session_view_json(params.instance_id.as_deref(), params.paths))
+        Self::tool_result(self.set_session_view_json(
+            params.instance_id.as_deref(),
+            params.paths,
+            params.exclude_log_components,
+        ))
     }
 
     #[tool(
@@ -1060,7 +1493,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Drain inbound session events for the named instance, including human and remote InputObserved. Honors the last set_session_view mask. Optional until_log / until_generation_gt wait until any condition matches or wait_ms elapses."
+        description = "Drain inbound session events for the named instance, including human and remote InputObserved. Always echoes generation, activity, readerPage, readerSpine. Honors the last set_session_view mask. Optional until_log / until_activity / until_progress_page / until_generation_gt wait until any condition matches or wait_ms elapses. until_generation_gt 0 means current generation. matched is omitted unless an until-condition was set."
     )]
     async fn observe(
         &self,
@@ -1069,9 +1502,13 @@ impl McpServer {
         Self::tool_result(
             self.observe_wait_json(
                 params.instance_id.as_deref(),
-                params.wait_ms,
-                params.until_log.as_deref(),
-                params.until_generation_gt,
+                ObserveSpec {
+                    wait_ms: params.wait_ms,
+                    until_log: params.until_log.as_deref(),
+                    until_generation_gt: params.until_generation_gt,
+                    until_activity: params.until_activity.as_deref(),
+                    until_progress_page: params.until_progress_page,
+                },
             )
             .await,
         )
@@ -1081,7 +1518,7 @@ impl McpServer {
 #[tool_handler(
     name = "crosspoint-simulator-mcp-proxy",
     version = "0.1.0",
-    instructions = "Control and observe eBook firmware simulator instances over Session. A session appears when a simulator dials this process, or when start_instance launches the operator-configured --simulator binary. This server does not build firmware or accept a client-supplied binary path. Board and compile-time firmware options stay in the binary; Register reports them after connect. Tools that target a session require instance_id (1-64 bytes) unless --default-instance is set. Do not omit an id when only one simulator is connected. start_instance always requires an explicit instance_id and defaults to headless. sample_book (default true) seeds fs_/books/CrossPoint-Reader.epub from the committed README fixture; pass false for an empty library. auto_sleep (default false, or --auto-sleep / CSM_AUTO_SLEEP) seeds fs_/.crosspoint/settings.json with sleepTimeoutMinutes 31 (never); pass true to keep firmware's 10-minute idle sleep. Use list_instances and get_instance to see connected peers. inject_touch, inject_key, inject_home, and inject_swipe wait for InputAck unless wait is false. request_snapshot waits for a PNG SnapshotFrame. observe drains inbound events including human and remote InputObserved. Pass until_log and/or until_generation_gt to wait; wait_ms overrides the process default (--observe-wait-ms / CSM_OBSERVE_WAIT_MS, 8000). A non-empty set_session_view still receives heartbeats so get_instance.lastHeartbeat and until_generation_gt keep working; observe omits them unless heartbeat is in the mask. InputAck means the inject was queued, not that the panel painted; after inject, observe for ACT/ERS/GFX logs or a framebufferGeneration bump. Do not sleep as synchronization. Tap (inject_touch) when Register.capTouch is true; default X4 has no touch and no Home. shutdown_instance sends ShutdownRequest and reaps a child this server started. Read csm://capabilities for the machine-readable surface. csm://instances lists connections; csm://instances/{id} is one snapshot."
+    instructions = "Control and observe eBook firmware simulator instances over Session. A session appears when a simulator dials this process, or when start_instance launches the operator-configured --simulator binary. This server does not build firmware or accept a client-supplied binary path. Board and compile-time firmware options stay in the binary; Register reports them after connect. Tools that target a session require instance_id (1-64 bytes) unless --default-instance is set. Do not omit an id when only one simulator is connected. start_instance always requires an explicit instance_id and defaults to headless. sample_book (default true) seeds fs_/books/CrossPoint-Reader.epub from the committed README fixture; pass false for an empty library. auto_sleep (default false, or --auto-sleep / CSM_AUTO_SLEEP) seeds fs_/.crosspoint/settings.json with sleepTimeoutMinutes 31 (never); pass true to keep firmware's 10-minute idle sleep. Use list_instances and get_instance to see connected peers. inject_touch, inject_key, inject_home, and inject_swipe wait for UiResult (wait_mode=paint) unless wait is false or wait_mode=ack. Touch and swipe coordinates default to logical pixels; pass space=panel for framebuffer pixels. inject_batch runs those injects sequentially and stops on the first rejection. request_snapshot waits for a PNG SnapshotFrame. observe drains inbound events including human and remote InputObserved. It always echoes generation, activity, readerPage, and readerSpine from lastHeartbeat. Pass until_log, until_activity, until_progress_page, and/or until_generation_gt to wait; until_generation_gt 0 means the current generation (wait for a bump). matched and timedOut are omitted unless an until-condition was set. wait_ms overrides the process default (--observe-wait-ms / CSM_OBSERVE_WAIT_MS, 8000). A non-empty set_session_view still receives heartbeats so get_instance.lastHeartbeat and until_generation_gt keep working; observe omits them unless heartbeat is in the mask. exclude_log_components (for example MEM, SCT) drops those LogLine components. Do not sleep as synchronization. Tap (inject_touch) when Register.capTouch is true; default X4 has no touch and no Home. shutdown_instance sends ShutdownRequest and reaps a child this server started. Read csm://capabilities for the machine-readable surface. csm://instances lists connections; csm://instances/{id} is one snapshot."
 )]
 impl ServerHandler for McpServer {
     fn get_info(&self) -> ServerInfo {
@@ -1231,8 +1668,8 @@ mod tests {
     use std::time::Duration;
 
     use csm_pb_bindings::generated::crosspoint::sim::control::v1alpha1::{
-        Heartbeat, InputAck, InputObserved, InputSource, KeyEdge, LogLine, Register, SimToServer,
-        SnapshotError, SnapshotFrame, server_to_sim,
+        CoordinateSpace, Heartbeat, InputAck, InputObserved, InputSource, KeyEdge, LogLine,
+        Register, SimToServer, SnapshotError, SnapshotFrame, UiResult, server_to_sim,
     };
     use tokio::sync::mpsc;
 
@@ -1251,6 +1688,19 @@ mod tests {
         let (tx, rx) = mpsc::channel(8);
         let (_token, sink) = map.insert(register(id), 8, tx);
         (rx, sink)
+    }
+
+    fn wait_spec(
+        wait_ms: Option<u32>,
+        until_log: Option<&str>,
+        until_generation_gt: Option<u64>,
+    ) -> ObserveSpec<'_> {
+        ObserveSpec {
+            wait_ms,
+            until_log,
+            until_generation_gt,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -1277,7 +1727,7 @@ mod tests {
         let (mut rx, _sink) = insert(&map, "sim-a");
         let mcp = McpServer::new(map);
         let queued = mcp
-            .inject_touch_json(Some("sim-a"), 3, 10, 20, false)
+            .inject_touch_json(Some("sim-a"), 3, 10, 20, false, None, None, None)
             .await
             .unwrap();
         assert_eq!(queued["queued"], true);
@@ -1289,6 +1739,7 @@ mod tests {
                 assert_eq!(touch.kind, 3);
                 assert_eq!(touch.x, 10);
                 assert_eq!(touch.y, 20);
+                assert_eq!(touch.coordinate_space, CoordinateSpace::Logical);
             }
             other => panic!("unexpected payload: {other:?}"),
         }
@@ -1303,19 +1754,19 @@ mod tests {
         assert!(mcp.shutdown_instance_json(Some("nope")).is_err());
         mcp.shutdown_instance_json(Some("sim-a")).unwrap();
         assert_eq!(
-            mcp.inject_key_json(Some("sim-a"), "ENTER".into(), 0, false)
+            mcp.inject_key_json(Some("sim-a"), "ENTER".into(), 0, false, None, None)
                 .await
                 .unwrap_err(),
             "outbound queue is full"
         );
         assert_eq!(
-            mcp.inject_key_json(Some("sim-a"), "ENTER".into(), 0, true)
+            mcp.inject_key_json(Some("sim-a"), "ENTER".into(), 0, true, None, None)
                 .await
                 .unwrap_err(),
             "outbound queue is full"
         );
         assert_eq!(
-            mcp.inject_touch_json(Some("nope"), 3, 0, 0, true)
+            mcp.inject_touch_json(Some("nope"), 3, 0, 0, true, None, None, None)
                 .await
                 .unwrap_err(),
             "unknown instance"
@@ -1415,7 +1866,7 @@ mod tests {
             ..Default::default()
         });
         let mcp = McpServer::new(map);
-        mcp.set_session_view_json(Some("sim-a"), vec!["log".into()])
+        mcp.set_session_view_json(Some("sim-a"), vec!["log".into()], vec![])
             .unwrap();
         let observed = mcp.observe_json(Some("sim-a")).unwrap();
         let events = observed["events"].as_array().unwrap();
@@ -1441,7 +1892,7 @@ mod tests {
         let map = InstanceMap::new();
         let (mut rx, _sink) = insert(&map, "sim-a");
         let mcp = McpServer::new(map.clone());
-        mcp.set_session_view_json(Some("sim-a"), vec!["log".into()])
+        mcp.set_session_view_json(Some("sim-a"), vec!["log".into()], vec![])
             .unwrap();
         assert_eq!(map.read_mask("sim-a").unwrap(), vec!["log".to_string()]);
         match rx.try_recv().unwrap().payload {
@@ -1464,7 +1915,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
         let (token, _sink) = map.insert(register("sim-a"), 8, tx);
         let mcp = McpServer::new(map.clone());
-        mcp.set_session_view_json(Some("sim-a"), vec!["log".into()])
+        mcp.set_session_view_json(Some("sim-a"), vec!["log".into()], vec![])
             .unwrap();
         assert_eq!(map.read_mask("sim-a").unwrap(), vec!["log".to_string()]);
         match rx.try_recv().unwrap().payload {
@@ -1489,7 +1940,7 @@ mod tests {
             },
         );
         let generation = mcp
-            .observe_wait_json(Some("sim-a"), Some(50), None, Some(5))
+            .observe_wait_json(Some("sim-a"), wait_spec(Some(50), None, Some(5)))
             .await
             .unwrap();
         assert_eq!(generation["matched"], true);
@@ -1515,9 +1966,7 @@ mod tests {
         let hit = mcp
             .observe_wait_json(
                 Some("sim-a"),
-                Some(50),
-                Some("Entering activity: Home"),
-                None,
+                wait_spec(Some(50), Some("Entering activity: Home"), None),
             )
             .await
             .unwrap();
@@ -1526,7 +1975,7 @@ mod tests {
         assert_eq!(hit["events"].as_array().unwrap().len(), 1);
 
         let miss = mcp
-            .observe_wait_json(Some("sim-a"), Some(40), Some("ERS Rendered page"), None)
+            .observe_wait_json(Some("sim-a"), wait_spec(Some(40), Some("ERS Rendered page"), None))
             .await
             .unwrap();
         assert_eq!(miss["matched"], false);
@@ -1549,7 +1998,7 @@ mod tests {
         );
         let mcp = McpServer::new(map.clone());
         let generation = mcp
-            .observe_wait_json(Some("sim-a"), Some(50), None, Some(3))
+            .observe_wait_json(Some("sim-a"), wait_spec(Some(50), None, Some(3)))
             .await
             .unwrap();
         assert_eq!(generation["matched"], true);
@@ -1558,7 +2007,7 @@ mod tests {
         let mcp_late = McpServer::new(map);
         let waiter = tokio::spawn(async move {
             mcp_late
-                .observe_wait_json(Some("sim-a"), Some(400), Some("ERS Rendered page"), None)
+                .observe_wait_json(Some("sim-a"), wait_spec(Some(400), Some("ERS Rendered page"), None))
                 .await
         });
         tokio::time::sleep(Duration::from_millis(30)).await;
@@ -1584,18 +2033,18 @@ mod tests {
         insert(&map, "sim-a");
         let mcp = McpServer::new(map);
         let observed = mcp
-            .observe_wait_json(Some("sim-a"), None, None, None)
+            .observe_wait_json(Some("sim-a"), wait_spec(None, None, None))
             .await
             .unwrap();
-        assert_eq!(observed["matched"], true);
-        assert_eq!(observed["timedOut"], false);
+        assert!(observed.get("matched").is_none());
+        assert!(observed.get("timedOut").is_none());
         assert!(observed["events"].as_array().unwrap().is_empty());
         let waited = mcp
-            .observe_wait_json(Some("sim-a"), Some(40), None, None)
+            .observe_wait_json(Some("sim-a"), wait_spec(Some(40), None, None))
             .await
             .unwrap();
-        assert_eq!(waited["matched"], true);
-        assert_eq!(waited["timedOut"], false);
+        assert!(waited.get("matched").is_none());
+        assert!(waited.get("timedOut").is_none());
     }
 
     #[tokio::test]
@@ -1603,10 +2052,10 @@ mod tests {
         let map = InstanceMap::new();
         let (mut rx, _sink) = insert(&map, "sim-a");
         let mcp = McpServer::new(map);
-        mcp.inject_home_json(Some("sim-a"), 40, false)
+        mcp.inject_home_json(Some("sim-a"), 40, false, None, None)
             .await
             .unwrap();
-        mcp.inject_swipe_json(Some("sim-a"), 1, 2, 3, 4, 50, false)
+        mcp.inject_swipe_json(Some("sim-a"), 1, 2, 3, 4, 50, false, None, None, None)
             .await
             .unwrap();
         mcp.set_inject_enabled_json(Some("sim-a"), false).unwrap();
@@ -1615,7 +2064,7 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(snap.is_error, Some(true));
-        mcp.set_session_view_json(Some("sim-a"), vec!["log".into(), "input_observed".into()])
+        mcp.set_session_view_json(Some("sim-a"), vec!["log".into(), "input_observed".into()], vec![])
             .unwrap();
         let kinds: Vec<_> = (0..5)
             .map(|_| match rx.try_recv().unwrap().payload {
@@ -1637,7 +2086,10 @@ mod tests {
         let mcp = McpServer::new(map.clone());
         let waiter =
             tokio::spawn(
-                async move { mcp.inject_touch_json(Some("sim-a"), 3, 10, 20, true).await },
+                async move {
+                    mcp.inject_touch_json(Some("sim-a"), 3, 10, 20, true, Some("ack"), None, None)
+                        .await
+                },
             );
         let msg = rx.recv().await.unwrap();
         assert!(msg.ack_requested);
@@ -1666,7 +2118,7 @@ mod tests {
         let (mut rx, _sink) = insert(&map, "sim-a");
         let mcp = McpServer::new(map.clone());
         let waiter = tokio::spawn(async move {
-            mcp.inject_key_json(Some("sim-a"), "ENTER".into(), 0, true)
+            mcp.inject_key_json(Some("sim-a"), "ENTER".into(), 0, true, Some("ack"), None)
                 .await
         });
         let msg = rx.recv().await.unwrap();
@@ -1694,7 +2146,10 @@ mod tests {
         let (mut rx, _sink) = insert(&map, "sim-a");
         let mcp = McpServer::new(map.clone());
         let waiter =
-            tokio::spawn(async move { mcp.inject_home_json(Some("sim-a"), 0, true).await });
+            tokio::spawn(async move {
+                mcp.inject_home_json(Some("sim-a"), 0, true, Some("ack"), None)
+                    .await
+            });
         let msg = rx.recv().await.unwrap();
         map.push_inbound(
             "sim-a",
@@ -1719,8 +2174,19 @@ mod tests {
         let (mut rx, _sink) = insert(&map, "sim-a");
         let mcp = McpServer::new(map.clone());
         let waiter = tokio::spawn(async move {
-            mcp.inject_swipe_json(Some("sim-a"), 1, 2, 3, 4, 10, true)
-                .await
+            mcp.inject_swipe_json(
+                Some("sim-a"),
+                1,
+                2,
+                3,
+                4,
+                10,
+                true,
+                Some("ack"),
+                None,
+                None,
+            )
+            .await
         });
         let msg = rx.recv().await.unwrap();
         map.push_inbound(
@@ -1743,7 +2209,10 @@ mod tests {
         let (token, _sink) = map.insert(register("sim-a"), 4, tx);
         let mcp = McpServer::new(map.clone());
         let waiter =
-            tokio::spawn(async move { mcp.inject_home_json(Some("sim-a"), 0, true).await });
+            tokio::spawn(async move {
+                mcp.inject_home_json(Some("sim-a"), 0, true, Some("ack"), None)
+                    .await
+            });
         tokio::time::sleep(Duration::from_millis(20)).await;
         map.remove_if("sim-a", token);
         assert_eq!(waiter.await.unwrap().unwrap_err(), "instance disconnected");
@@ -1892,7 +2361,7 @@ mod tests {
                 .iter()
                 .find_map(ContentBlock::as_text)
                 .map(|text| text.text.as_str()),
-            Some("unexpected session reply")
+            Some("timed out waiting for session reply")
         );
     }
 
@@ -1904,6 +2373,9 @@ mod tests {
         assert!(instructions.contains("sample_book"));
         assert!(instructions.contains("auto_sleep"));
         assert!(instructions.contains("until_log"));
+        assert!(instructions.contains("wait_mode"));
+        assert!(instructions.contains("inject_batch"));
+        assert!(instructions.contains("until_activity"));
         assert!(instructions.contains("lastHeartbeat"));
         assert!(instructions.contains("framebufferGeneration"));
         assert!(instructions.contains("capTouch"));
@@ -1918,7 +2390,21 @@ mod tests {
         assert_eq!(caps["spawn"]["autoSleep"]["neverMinutes"], 31);
         assert_eq!(caps["observe"]["waitMsDefault"], 8000);
         assert_eq!(caps["observe"]["untilLogParam"], "until_log");
+        assert_eq!(caps["observe"]["untilActivityParam"], "until_activity");
+        assert_eq!(
+            caps["observe"]["untilProgressPageParam"],
+            "until_progress_page"
+        );
+        assert_eq!(caps["observe"]["untilGenerationGtZeroMeansCurrent"], true);
+        assert_eq!(caps["observe"]["matchedOnlyWithUntil"], true);
         assert_eq!(caps["observe"]["heartbeatAlwaysOnWire"], true);
+        assert_eq!(caps["inject"]["waitModeDefault"], "paint");
+        assert_eq!(caps["inject"]["coordinateSpaceDefault"], "logical");
+        assert_eq!(caps["inject"]["batchTool"], "inject_batch");
+        assert_eq!(
+            caps["sessionView"]["excludeLogComponentsParam"],
+            "exclude_log_components"
+        );
         assert_eq!(
             caps["firmware"]["boardIds"],
             json!(["x4", "x3", "x4_pro", "sticky", "paper_mono"])
@@ -1947,6 +2433,204 @@ mod tests {
             McpServer::capabilities_json(true)["spawn"]["configured"],
             true
         );
+    }
+
+    #[tokio::test]
+    async fn inject_wait_paint_completes_on_ui_result() {
+        let map = InstanceMap::new();
+        let (mut rx, _sink) = insert(&map, "sim-a");
+        let mcp = McpServer::new(map.clone());
+        let waiter = tokio::spawn(async move {
+            mcp.inject_touch_json(Some("sim-a"), 3, 240, 350, true, None, None, None)
+                .await
+        });
+        let msg = rx.recv().await.unwrap();
+        assert!(msg.ack_requested);
+        match msg.payload {
+            Some(server_to_sim::Payload::InjectTouch(touch)) => {
+                assert_eq!(touch.coordinate_space, CoordinateSpace::Logical);
+            }
+            other => panic!("{other:?}"),
+        }
+        map.push_inbound(
+            "sim-a",
+            SimToServer {
+                corr: msg.corr,
+                payload: Some(
+                    InputAck {
+                        accepted: true,
+                        ..Default::default()
+                    }
+                    .into(),
+                ),
+                ..Default::default()
+            },
+        );
+        map.push_inbound(
+            "sim-a",
+            SimToServer {
+                corr: msg.corr,
+                payload: Some(
+                    UiResult {
+                        painted: true,
+                        generation: 12,
+                        activity: "Home".into(),
+                        ..Default::default()
+                    }
+                    .into(),
+                ),
+                ..Default::default()
+            },
+        );
+        let result = waiter.await.unwrap().unwrap();
+        assert_eq!(result["accepted"], true);
+        assert_eq!(result["painted"], true);
+        assert_eq!(result["generation"], 12);
+        assert_eq!(result["activity"], "Home");
+    }
+
+    #[tokio::test]
+    async fn inject_batch_stops_on_reject() {
+        let map = InstanceMap::new();
+        let (mut rx, _sink) = insert(&map, "sim-a");
+        let mcp = McpServer::new(map.clone());
+        let waiter = tokio::spawn(async move {
+            mcp.inject_batch_json(
+                Some("sim-a"),
+                true,
+                Some("ack"),
+                None,
+                None,
+                &[
+                    InjectBatchStep {
+                        kind: "key".into(),
+                        name: Some("ENTER".into()),
+                        ..Default::default()
+                    },
+                    InjectBatchStep {
+                        kind: "key".into(),
+                        name: Some("BACK".into()),
+                        ..Default::default()
+                    },
+                ],
+            )
+            .await
+        });
+        let first = rx.recv().await.unwrap();
+        map.push_inbound(
+            "sim-a",
+            SimToServer {
+                corr: first.corr,
+                payload: Some(
+                    InputAck {
+                        accepted: false,
+                        reason: "inject_disabled".into(),
+                        ..Default::default()
+                    }
+                    .into(),
+                ),
+                ..Default::default()
+            },
+        );
+        let body = waiter.await.unwrap().unwrap();
+        assert_eq!(body["stopped"], true);
+        assert_eq!(body["failedIndex"], 0);
+        assert_eq!(body["error"], "inject_disabled");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn observe_until_generation_gt_zero_waits_for_a_bump() {
+        let map = InstanceMap::new();
+        let (tx, _rx) = mpsc::channel(8);
+        let (token, _sink) = map.insert(register("sim-a"), 8, tx);
+        map.set_heartbeat(
+            "sim-a",
+            token,
+            Heartbeat {
+                framebuffer_generation: 7,
+                activity: "Home".into(),
+                reader_page: 2,
+                reader_spine: 0,
+                ..Default::default()
+            },
+        );
+        let mcp = McpServer::new(map.clone());
+        let waiter = tokio::spawn({
+            let mcp = mcp.clone();
+            async move {
+                mcp.observe_wait_json(
+                    Some("sim-a"),
+                    ObserveSpec {
+                        wait_ms: Some(400),
+                        until_generation_gt: Some(0),
+                        ..Default::default()
+                    },
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        map.set_heartbeat(
+            "sim-a",
+            token,
+            Heartbeat {
+                framebuffer_generation: 8,
+                activity: "Home".into(),
+                reader_page: 2,
+                ..Default::default()
+            },
+        );
+        let body = waiter.await.unwrap().unwrap();
+        assert_eq!(body["matched"], true);
+        assert_eq!(body["generation"], 8);
+        assert_eq!(body["activity"], "Home");
+        assert_eq!(body["readerPage"], 2);
+    }
+
+    #[tokio::test]
+    async fn observe_until_activity_and_progress_page() {
+        let map = InstanceMap::new();
+        let (tx, _rx) = mpsc::channel(8);
+        let (token, _sink) = map.insert(register("sim-a"), 8, tx);
+        map.set_heartbeat(
+            "sim-a",
+            token,
+            Heartbeat {
+                activity: "EpubReader".into(),
+                reader_page: 4,
+                reader_spine: 1,
+                ..Default::default()
+            },
+        );
+        let mcp = McpServer::new(map);
+        let activity = mcp
+            .observe_wait_json(
+                Some("sim-a"),
+                ObserveSpec {
+                    wait_ms: Some(50),
+                    until_activity: Some("EpubReader"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(activity["matched"], true);
+        assert_eq!(activity["activity"], "EpubReader");
+        let page = mcp
+            .observe_wait_json(
+                Some("sim-a"),
+                ObserveSpec {
+                    wait_ms: Some(50),
+                    until_progress_page: Some(4),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(page["matched"], true);
+        assert_eq!(page["readerPage"], 4);
+        assert_eq!(page["readerSpine"], 1);
     }
 
     #[tokio::test]

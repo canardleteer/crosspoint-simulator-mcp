@@ -13,7 +13,7 @@ The firmware UI is the interface. Drive it with Session tools on the
 `crosspoint-simulator` MCP server. Do not invent sleeps as a substitute
 for knowing the UI finished.
 
-After each new screen or missed tap, add the working panel hit (and
+After each new screen or missed tap, add the working **logical** hit (and
 what failed) to **Device profiles** or **Touch** in this file so the
 next session does not rediscover it. Label every numeric hit with
 `boardId`, theme, and orientation. Those pixels are **not** portable
@@ -22,24 +22,69 @@ across boards, themes, firmware builds, or settings (optional rows,
 theme grid; treat listed coordinates as one confirmed session, not a
 universal map.
 
+Hits below were confirmed on **X4 Pro + Lyra + Portrait** (logical
+480×800, panel 800×480) against CrossPoint Reader `Register.version`
+`dev-simulator` (v1.5.0-line firmware). `wait_mode=paint` unless noted.
+
 ## Loop
 
 1. `inject_*` to act. Pick the inject from `Register` (see **Device
    profiles**): tap when `capTouch` is true; keys when it is not.
-2. `observe` immediately to know the action landed.
-3. `request_snapshot` from time to time to confirm you are on the screen
-   you think you are: after a new activity, after a few list moves,
-   before a tap or a book open, and whenever the highlight or path
-   might have drifted. Use the snapshot to read labels, not as a wait
-   and not as the source of panel coordinates (snapshots are often
-   described rotated).
+   Touch/swipe `x`/`y` are **logical** pixels by default. `wait_mode`
+   defaults to **paint**: the tool returns after `UiResult`
+   (`painted`, `generation`, `activity`). A miss is `painted: false`.
+2. `observe` only when the next inject depends on a value you do not
+   already have (`activity`, `readerPage`, a label). Prefer
+   `until_activity`, `until_progress_page`, or `until_generation_gt: 0`
+   (bump from the current heartbeat). Do **not** use `until_log` as a
+   barrier. After a known hit that painted, fire the next inject.
+   `wait_ms` is a miss ceiling (about **400** for a tap). First EPUB
+   open, a chapter jump, and a cache rebuild are the exceptions (index;
+   a few seconds; raise inject `wait_ms` above the 2s reply timeout).
+   Do not use the process default 8000 as a per-tap wait.
+3. `request_snapshot` only when you need a **label** for the next tap
+   or the path may have drifted. Do not snapshot after a known hit
+   that already painted. Snapshots are not a wait and not the source
+   of coordinates (they are often described rotated).
+
+## Drive fast
+
+- Use **logical** taps and `wait_mode=paint`. Do not convert through
+  panel math. Example (X4 Pro, Lyra, Portrait): Browse Files
+  `(240, 350)` then first row `(240, 170)` then the EPUB. The EPUB tap
+  already returns `activity: EpubReader` and `painted: true` when the
+  reader first paints; wait only if you need a page:
+  `until_progress_page` or `until_generation_gt: 0`.
+- `inject_batch` for a known chain. Each paint-wait uses `UiResult`.
+  Stop on the first rejection. Two next-page taps in one batch both
+  painted (pages 1 then 2). Firmware already queues a second page
+  turn inside 200ms.
+- After paint, read `generation` / `activity` on the inject result.
+  Do not `observe` just to learn whether it painted.
+- `observe` / `get_instance` `activity` and `readerPage` come from
+  `lastHeartbeat` and can lag until the next heartbeat. An
+  `until_activity` match can return on a drained `Entering activity:`
+  line while the echo still names the previous screen. Trust the
+  inject result, or the drained `ACT` line plus `matched`.
+- After a **stack pop** (`BACK` from Text Settings; chapter list
+  returning to the reader) there is no `Entering activity:` for the
+  screen you landed on. `Heartbeat.activity` stays at the last
+  **Entering** name. Do not `until_activity` the parent.
+- Exclude `MEM` (and `SCT` when not opening a book) via
+  `set_session_view` `exclude_log_components` so those lines never
+  occupy the queue.
+- Keys on a touch board are a fallback, not the fast path.
+- First EPUB open is the one slow firmware path (index + cache).
+  Resume is fast when the cache is intact. Changing font size can
+  invalidate it (`Cache not found` / `Partial cache found`).
 
 `get_instance` carries `lastHeartbeat.framebufferGeneration` (and
 `headless`) and `Register`. `boardId` is `x4`, `x3`, `x4_pro`,
 `sticky`, or `paper_mono`. `capFrontlight` is any frontlight style
 (including Paper Mono PMIC), not PWM-only. Proto3 JSON omits false
-bools: `capTouch` / `capHome` / `capFrontlight` absent means false.
-Several instances may be up at once; always name `instance_id`.
+bools and zeros: `capTouch` / `capHome` / `capFrontlight` absent
+means false; `readerPage` 0 may be omitted. Several instances may
+be up at once; always name `instance_id`.
 
 ## Device profiles
 
@@ -59,50 +104,56 @@ Efficiency:
 - **No touch (X4 / X3):** one `DOWN` per row, then `ENTER`. Snapshot
   before assuming Browse Files is still the default highlight (after a
   book, home confirm is Resume). Reader pages: `LEFT` / `RIGHT`.
-- **Touch (X4 Pro / Sticky / Paper Mono):** one tap on the label.
-  Compute **panel** pixels from the theme hit grid (below), then
-  confirm with `ACT` / `GFX`. A missed tap often produces `InputAck`
-  and `InputObserved` but **no** generation bump and no
-  `Entering activity`.
+- **Touch (X4 Pro / Sticky / Paper Mono):** one tap on the label in
+  **logical** pixels (MCP default). Confirm with `UiResult.painted` or
+  `until_activity`. A miss is `painted: false` (Ack still happened).
 - **Home key boards (X4 Pro):** `inject_home` is faster than repeated
-  `BACK` when you only need Home. `BACK` from Text Settings returns to
-  Settings without an `Entering activity: Settings` line (stack pop).
+  `BACK` when you only need Home. `inject_home` while already on Home
+  is `painted: false`. `BACK` from Text Settings returns to Settings
+  without an `Entering activity: Settings` line (stack pop).
+  `inject_home` from Text Settings that was pushed from the reader
+  exits TextSettings **and** EpubReader, then Home.
 - **Reader pages (default `touchReaderControls=TOUCH_READER_ON`):** tap
   the **right third** for next, **left third** for previous. A logical
-  left-swipe (`inject_swipe` along panel Y) is accepted and observed
-  but does **not** turn the page until Settings → Controls sets
-  Swipe. Do not use `UP`/`DOWN` for page turns. Button boards still
-  use `LEFT`/`RIGHT`.
+  swipe is accepted and observed but `painted: false` and does **not**
+  turn the page until Settings → Controls sets Swipe. Do not use
+  `UP`/`DOWN` for page turns. Button boards still use `LEFT`/`RIGHT`.
 - **Reader chrome:** on a button board, `ENTER` opens
   `EpubReaderMenu`. On touch, tap the **center third**
-  (`isTouchMenuTap`) — panel **(400, 240)** on 800×480 Portrait.
+  (`isTouchMenuTap`) — logical **(240, 400)** on 480×800 Portrait.
   From that menu, Text Settings is shorter than Home → Settings →
-  Reader. Snapshot the menu before tapping: Footnotes and Bookmarks
-  rows are optional and shift later hits.
+  Reader. Snapshot the menu before tapping: Footnotes, Bookmarks,
+  and Frontlight rows are optional and shift later hits.
 
-## InputAck is not a paint
+## Paint vs ack
 
-Inject waits (default) only mean the edge was accepted onto the
-simulator's input queue. The panel updates after firmware handles that
-edge.
+Default `wait_mode=paint` waits for `UiResult` on the same corr:
+`painted` is true when framebuffer generation increased after the
+inject was queued, false after a ~400ms miss. `wait_mode=ack` is the
+old `InputAck` (queued, not painted). `wait: false` enqueues only.
+The session reply timeout is **2s**; a chapter jump or cache rebuild
+that indexes past that returns `timed out waiting for session reply`
+even though the tap was applied. Raise `wait_ms`, or `wait: false`
+then `until_progress_page` / `until_generation_gt: 0`.
 
 Useful `observe` lines (need firmware `LOG_LEVEL` ≥ 2 so `LOG_DBG` is
 compiled in):
 
 - `ACT` `Entering activity: <Name>` / `Exiting activity: <Name>` /
   `Pushed to activity stack` / `Popped from activity stack` — different
-  activity
+  activity. `Exiting` does not clear `Heartbeat.activity`.
 - `GFX` `Time = N ms from clearScreen to displayBuffer` — a frame was
   submitted
 - `ERS` `Rendered page in Nms` and `Progress saved: … page=N` — reader
   page turn finished
 - `heartbeat.framebufferGeneration` increased — SDL presented a new
   frame (read `get_instance` if heartbeats are masked out of `observe`)
-- After `start_instance`, wait for `ACT Entering activity: Home` before
+- After `start_instance`, wait for `until_activity: Home` before
   driving the home menu (`Register` is earlier, during Boot)
-- Opening an EPUB: `EBP Loaded ePub: …` then `ERS Rendered page`
-  (first open also logs `EBP Total indexing` and `ERS Cache not found,
-  building…` / `SCT Page N processed`)
+- Opening an EPUB: inject may already report `EpubReader` + painted;
+  `EBP Loaded ePub` then `ERS Rendered page` follow (first open also
+  logs `EBP Total indexing` and `ERS Cache not found, building…` /
+  `SCT Page N processed`)
 - `BACK` from the reader: `Exiting activity: EpubReader` then
   `Entering activity: Home` (not the file browser)
 
@@ -131,35 +182,31 @@ sleep. The process default is `--auto-sleep` / `CSM_AUTO_SLEEP`.
 
 ## Touch
 
-Hits below were confirmed on **X4 Pro + Lyra + Portrait** (panel
-800×480, logical 480×800) against one CrossPoint Reader build. Do not
-reuse them on X3 (792×528), a different theme (RoundedRaff / Base),
-Landscape, or after firmware layout changes. Prefer theme metrics +
+Hits are **logical** unless marked `space=panel`. Do not reuse them on
+X3 (792×528), a different theme (RoundedRaff / Base), Landscape, or
+after firmware layout changes. Prefer theme metrics +
 `Register.width`/`height`/`boardId`, then confirm with `ACT` / `GFX`.
 
 Read `Register.capTouch` (and `capHome`) after connect.
 
-`inject_touch` `x`/`y` are **panel pixels** on the framebuffer
-(`Register.width` × `Register.height`). They are not SDL window pixels
-and not the rotated snapshot description. `kind` 3 is a tap. Observed
-`touch.nx` / `ny` are that point normalized to the panel.
+`inject_touch` `x`/`y` default to **logical** pixels (firmware
+`GfxRenderer` width × height). Pass `space=panel` for framebuffer
+pixels (`Register.width` × `Register.height`). They are not SDL
+window pixels and not the rotated snapshot description. `kind` 3 is a
+tap. Observed `touch.nx` / `ny` stay panel-normalized.
 
-Firmware hit-tests in **logical** coordinates
-(`GfxRenderer::getScreenWidth/Height`). On X4 / X4 Pro home the usual
-orientation is **Portrait**: logical 480×800, panel 800×480.
+On X4 / X4 Pro home the usual orientation is **Portrait**: logical
+480×800, panel 800×480. Heartbeat.orientation is the GfxRenderer enum
+(0=Portrait, 1=LandscapeClockwise, 2=PortraitInverted,
+3=LandscapeCounterClockwise). The simulator converts logical→panel.
 
-```
-panel_x = logical_y
-panel_y = (panel_height - 1) - logical_x
-```
+Portrait conversion if you must reuse an old panel hit with
+`space=panel`, or convert it: `logical_x = (panel_height - 1) -
+panel_y`, `logical_y = panel_x`. New driving should use logical.
 
-Center of a portrait row is about `logical_x = 240` → `panel_y = 239`
-on an 800×480 panel.
-
-A tap that is accepted but misses the widget does not change
-`framebufferGeneration`. Snapshot after a miss; do not increment a
-guess by large steps along the long panel axis (that overshoots the
-menu). Use the theme grid, then nudge ~20–40 px if needed.
+A tap that is accepted but misses the widget returns `painted: false`.
+Snapshot after a miss; nudge ~20–40 logical px. Do not re-derive
+Portrait panel math.
 
 ### Lyra home (X4 Pro, no recents)
 
@@ -170,34 +217,34 @@ Theme: `homeTopPadding=56`, `homeCoverTileHeight=242`,
 - `rowStep` = 64+8 = **72**
 - Rows (no OPDS, no Continue Reading): 0 Browse Files, 1 Recent Books,
   2 File Transfer, 3 Settings
-- Browse Files (row 0) logical y ≈ 314+36 = **350** → panel **(350, 240)**
-  → `Entering activity: FileBrowser`
-- Recent Books (row 1) → panel **(422, 240)** →
-  `Entering activity: RecentBooks`. First row **(170, 240)** reopens
-  the sample EPUB (same first-row hit as FileBrowser).
-- File Transfer (row 2) → panel **(494, 240)** →
-  `CrossPointWebServer` then `NetworkModeSelection` (Join a Network /
-  Calibre Wireless / Create Hotspot). `inject_home` exits both.
-- Settings logical y ≈ 314+3×72+32 = **562** → panel **(560, 240)**
-- Panel **(700, 240)** is below the menu; miss, no redraw
+- Browse Files (row 0) **(240, 350)** → `FileBrowser`
+- Recent Books (row 1) **(240, 422)** → `RecentBooks`. First row
+  **(240, 170)** reopens the sample EPUB (same first-row hit as
+  FileBrowser).
+- File Transfer (row 2) **(240, 494)** → `CrossPointWebServer` then
+  `NetworkModeSelection` (Join a Network / Calibre Wireless / Create
+  Hotspot). `inject_home` exits both.
+- Settings (row 3) **(240, 562)** → `Settings`
+- **(240, 700)** is below the menu; `painted: false`, no redraw
 
 After a book has been opened, Home shows a cover card (may log
 `No known cover image for thumbnail`). Menu row math is unchanged.
-`inject_home` from Text Settings that was pushed from the reader
-exits TextSettings **and** EpubReader, then Home.
+Cover tile is `homeTopPadding`…`+homeCoverTileHeight` (56–298).
+Resume tap: **(240, 177)** → `EpubReader`. Faster than Browse Files
+when the cache is intact (`ERS Cache found, skipping build`).
 
-`HomeActivity` uses `rowTouch` on the full width (`xStart=0`,
-`xEnd=INT32_MAX`); `panel_y` only needs to land in the row band.
+`HomeActivity` uses `rowTouch` on the full width; logical x can stay
+240.
 
 ### FileBrowser (X4 Pro, Lyra)
 
-First list row (folder or file) is about **(170, 240)**. That opened
-`books` at `/` and `CrossPoint-Reader.epub` under `/books`. Snapshot
-descriptions often guess a higher first-row X (~95); prefer **170**.
-Wait for `EBP Loaded ePub` then `ERS Rendered page` (first open also
-indexes: `ERS Cache not found` / `SCT Page N processed`).
-`Entering activity: EpubReader` may already have been drained by the
-time those ERS lines arrive.
+First list row (folder or file) is **(240, 170)**. That opened `books`
+at `/` and `CrossPoint-Reader.epub` under `/books`. Snapshot
+descriptions often guess a higher first-row Y; prefer **170**.
+First open: inject returns `EpubReader` + painted; `EBP Loaded ePub`
+and `ERS Rendered page` follow (`ERS Cache not found` / `SCT Page N
+processed` while indexing). `until_activity: EpubReader` may already
+be true from the inject.
 
 ### Settings (X4 Pro, Lyra)
 
@@ -205,18 +252,19 @@ Tabs are Display, Reader, Controls, System (`UiTabListActivity`).
 Font size is not on Display. Reader list hides per-field font size
 behind **Text Settings**.
 
-Confirmed panel hits (X4 Pro, Lyra, Portrait 800×480):
+Confirmed logical hits (X4 Pro, Lyra, Portrait 480×800):
 
-- Reader tab (2nd): **(110, 290)**
-- Controls tab (3rd): **(110, 200)** — shows `Touch Reader Controls:
+- Display tab (1st): **(99, 110)**
+- Reader tab (2nd): **(189, 110)**
+- Controls tab (3rd): **(279, 110)** — shows `Touch Reader Controls:
   Tap` by default
-- Text Settings row (first Reader list row): **(175, 240)** →
-  `Entering activity: TextSettings`
-- Touch Reader Controls row (Controls, 2nd list row): **(215, 240)**
-  opens an option popup (OFF / Tap / Swipe / Inverted Tap). A tap at
-  **(615, 240)** did not change the value (still Tap); snapshot X for
-  popup options is unreliable. Confirm the value on the list after
-  the popup closes.
+- System tab (4th): **(369, 110)** — GFX only this session; confirm
+  with a snapshot if the next tap needs a System label
+- Text Settings row (first Reader list row): **(240, 175)** →
+  `TextSettings`
+- Touch Reader Controls row (Controls, 2nd list row): **(240, 215)**
+  opens an option popup (OFF / Tap / Swipe / Inverted Tap). Snapshot
+  popup options; confirm the value on the list after the popup closes.
 
 ### Text Settings (X4 Pro)
 
@@ -224,52 +272,65 @@ Preview pane sits **above** the tab bar. Do not reuse Settings-tab Y
 for these tabs.
 
 - `tabTop` ≈ 297 (after header + preview). Tabs: Font | Size | Layout | Style
-- Size tab: **(317, 350)** (`logical_x` ≈ 129). **(317, 290)** hits
-  **Layout** (3rd tab; `logical_x` ≈ 189)
+- Size tab: **(129, 317)**
 - Size list rows (after tab bar): 12 / 14 / 16 / 18 pt
-- **16 pt**: **(525, 240)** — preview becomes `Noto Serif, 16 pt`.
-  `FDC Prewarm: … glyphs` is a good size-change signal (not only `GFX`)
+- **16 pt**: **(240, 525)** — `FDC Prewarm: … glyphs` is a good
+  size-change signal (not only `GFX`). This can invalidate the EPUB
+  cache; the next open may rebuild.
 
 BACK from Text Settings returns to Settings (no `Entering activity:
-Settings` line; stack pop). `inject_home` from Settings logs
-`Exiting activity: Settings` then `Entering activity: Home`.
+Settings` line; stack pop). Inject `activity` may still say
+`TextSettings`. `inject_home` from Settings logs `Exiting activity:
+Settings` then `Entering activity: Home`.
 
 ### Reader (X4 Pro, default tap zones)
 
 `SETTINGS.touchReaderControls` defaults to `TOUCH_READER_ON` (tap),
 not `TOUCH_READER_SWIPE`. Outer logical thirds (width/3 of 480 ≈ 160):
 
-- Next page: logical_x ≈ 400 → panel **(400, 80)** —
-  `Progress saved: … page=N`
-- Previous page: logical_x ≈ 80 → panel **(400, 400)** —
-  `Progress saved: … page=N` (confirmed)
-- Menu: center third in **both** axes → panel **(400, 240)** →
-  `Entering activity: EpubReaderMenu`
+- Next page: **(400, 400)** — `Progress saved: … page=N`
+- Previous page: **(80, 400)** — `Progress saved: … page=N`
+- Menu: center third in **both** axes → **(240, 400)** →
+  `EpubReaderMenu`
 
-A swipe from **(400, 80)** to **(400, 400)** (`duration_ms` 250) is
-observed as a trail of `kind` 1 moves and does **not** emit `ERS`.
+A swipe from **(400, 400)** to **(80, 400)** (`duration_ms` 250) is
+`painted: false` and does **not** emit `ERS`.
+
+Two next-page taps in one `inject_batch` both painted. Firmware
+`kMinManualTurnGapMs` is 200; a second tap inside that window is
+queued (`pendingManualTurn`), not lost. Some pages log
+`GFX !! Outside range` while still saving progress — treat
+`Progress saved` as success.
+
+Chapter list (`EpubReaderChapterSelection`): first-row math like
+FileBrowser. **(240, 170)** pops the list and starts a jump (may
+`SCT` index). That can exceed the 2s paint wait. Returning to the
+reader is a stack pop — no `Entering activity: EpubReader`. Wait with
+`until_progress_page` or `until_generation_gt: 0`.
 
 ### EpubReaderMenu (X4 Pro)
 
 Rows are optional: Footnotes if the book has them; Bookmarks only
-after at least one bookmark exists. `listRowHeight` is 40 (Lyra), but
-confirmed hits below are empirical — snapshot after the row set
-changes.
+after at least one bookmark exists; Frontlight when
+`Register.capFrontlight` is true. Snapshot after the row set
+changes. Empirical row step this session was about **68** logical y
+(not the 40px `listRowHeight`).
 
-With Footnotes, no Bookmarks (sample EPUB):
+This firmware + sample EPUB, no Footnotes, before any bookmark:
 
-- Toggle Bookmark: **(300, 240)** — `ERS Toggle bookmark` then return
+- Select Chapter: **(240, 165)** → `EpubReaderChapterSelection`
+- Toggle Bookmark: **(240, 233)** — `ERS Toggle bookmark` then return
   to the reader (menu pops)
-- Text Settings: **(350, 240)** → `Entering activity: TextSettings`
-- Night mode: **(410, 240)** and **(470, 240)** toggle ON/OFF in place
-  (`GFX` only; no activity change)
+- Text Settings: **(240, 300)** → `TextSettings`
 
-After adding a bookmark, a Bookmarks row appears above Toggle
-Bookmark. **(340, 240)** then opened `EpubReaderBookmarks`. `BACK`
-from Bookmarks returns to **EpubReaderMenu**, not the reader.
+Visible rows this session (snapshot): Select Chapter, Toggle
+Bookmark, Text Settings, Night mode, Frontlight, Look Up, Reading
+Orientation, Auto Turn, Go to %. After adding a bookmark, a
+Bookmarks row appears and later hits shift ~+68 logical y.
+`BACK` from Bookmarks returns to **EpubReaderMenu**, not the reader.
 
-Do not trust snapshot-described X for these rows; two descriptions
-put Text Settings at 470, which is Night mode.
+Do not trust snapshot-described X/Y for these rows; descriptions are
+often rotated.
 
 ## Keys on a button board
 
@@ -289,24 +350,49 @@ assuming Browse Files is still the default.
 `sample_book: false` leaves no `fs_/books/`; FileBrowser shows
 "No files found".
 
-## Do not starve observe
+## Observe and the inbound queue
 
-The inbound queue is 32 envelopes and drops overflow. Heartbeats are
-frequent. This server drops a heartbeat before a log when the queue is
-full, and a non-empty `set_session_view` mask is applied at enqueue so
-masked heartbeats never occupy a slot. Still call `observe` right after
-inject if you need the completion lines. Prefer `set_session_view`
-paths `log`, `input_ack`, `input_observed` while driving, and read
-generation from `get_instance`. Heartbeats still arrive on the wire so
-`lastHeartbeat` advances even when observe omits them.
+The inbound queue is 128 envelopes. Eviction drops newest heartbeats
+first, then `MEM`/`SCT` logs, then other logs, then oldest.
+**Never dropped:** `InputAck`, `UiResult`, `SnapshotFrame` /
+`SnapshotError`, and logs with component `ACT` or `ERS`.
 
-`observe` waits when you pass `until_log` (substring of `log.text`)
-and/or `until_generation_gt` (succeeds if
-`lastHeartbeat.framebufferGeneration` is greater). Either condition
-is enough. `wait_ms` is the timeout; omit it to use
-`--observe-wait-ms` / `CSM_OBSERVE_WAIT_MS` (default 8000). `wait_ms: 0`
-is a one-shot drain. The response includes `matched` and `timedOut`.
-Do not busy-loop with sleeps.
+A non-empty `set_session_view` mask is applied at enqueue so masked
+heartbeats never occupy a slot. Heartbeats still arrive on the wire so
+`lastHeartbeat` advances. Prefer paths `log`, `input_ack`,
+`input_observed`, `ui_result` while driving, and
+`exclude_log_components: ["MEM"]` (add `SCT` when not indexing).
+
+`observe` always echoes `generation`, `activity`, `readerPage`, and
+`readerSpine` from `lastHeartbeat`. Those echoes can lag the inject
+you just finished (next heartbeat). Until-conditions:
+`until_activity` (exact Heartbeat.activity, or `Entering activity:
+{name}` in drained logs), `until_progress_page` (Heartbeat.reader_page
+or `page=N` on `Progress saved`), `until_generation_gt` (greater than
+this; **0 means current generation**), and `until_log` (substring).
+Any until is enough. `matched` / `timedOut` appear **only** when an
+until-condition was set. `wait_ms` is a miss ceiling (about 400 for a
+tap; longer only for first EPUB open, chapter jump, or cache rebuild).
+`wait_ms: 0` is a one-shot drain. A match returns on the next 25ms
+poll. Do not busy-loop with sleeps.
+
+`until_progress_page` can match a **queued** `Progress saved` from an
+earlier tap. Drain (`wait_ms: 0`) or use a page you have not reached
+yet.
+
+## Host surface
+
+These Session/MCP fields are the driving API (not a wishlist):
+
+- `inject_*` `wait_mode=paint` (default) → `UiResult` (`painted`,
+  `generation`, `activity`). `wait_mode=ack` → `InputAck`.
+- Touch/swipe `space=logical` (MCP default) or `space=panel`.
+- `inject_batch` sequential steps; stop on first rejection.
+- `Heartbeat.activity`, `readerSpine`, `readerPage`, `orientation`.
+- `observe` until: `until_activity`, `until_progress_page`,
+  `until_generation_gt: 0`, `until_log`.
+- `SetSessionView.exclude_log_components`.
+- Queue 128; never-drop ACT/ERS/acks/`UiResult`/snapshots.
 
 ## Spawn and rebuild
 

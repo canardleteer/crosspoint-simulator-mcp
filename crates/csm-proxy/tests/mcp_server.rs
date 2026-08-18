@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use csm_pb_bindings::generated::crosspoint::sim::control::v1alpha1::{
-    InputAck, Register, SimToServer, SnapshotFrame,
+    InputAck, Register, SimToServer, SnapshotFrame, UiResult,
 };
 use csm_proxy::{
     CAPABILITIES_URI, INSTRUCTIONS, InstanceMap, McpServer, TOOL_NAMES, serve_mcp_http_listener,
@@ -102,6 +102,21 @@ async fn stdio_inject_and_snapshot_wait_for_session_replies() {
                 payload: Some(
                     InputAck {
                         accepted: true,
+                        ..Default::default()
+                    }
+                    .into(),
+                ),
+                ..Default::default()
+            },
+        );
+        map.push_inbound(
+            "sim-a",
+            SimToServer {
+                corr: inject.corr,
+                payload: Some(
+                    UiResult {
+                        painted: true,
+                        generation: 2,
                         ..Default::default()
                     }
                     .into(),

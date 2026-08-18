@@ -49,6 +49,16 @@ message Heartbeat {
   bool inject_enabled = 2;
   // True when local human input is off.
   bool headless = 3;
+  // Last firmware activity name from `Entering activity: Name`. Empty before
+  // the first enter. Stack pops do not clear this.
+  string activity = 4;
+  // Last `Progress saved` spine index. Zero before the first save.
+  int32 reader_spine = 5;
+  // Last `Progress saved` page index. Zero before the first save.
+  int32 reader_page = 6;
+  // GfxRenderer orientation: 0=Portrait, 1=LandscapeClockwise,
+  // 2=PortraitInverted, 3=LandscapeCounterClockwise.
+  uint32 orientation = 7;
 }
 
 // Ask the simulator to capture the panel (or a crop of it).
@@ -89,14 +99,27 @@ message SnapshotError {
   string message = 1;
 }
 
+// Which pixel space InjectTouch and InjectSwipe coordinates use.
+enum CoordinateSpace {
+  // Unset. Treated as panel pixels so existing clients keep working.
+  COORDINATE_SPACE_UNSPECIFIED = 0;
+  // Panel framebuffer pixels (`Register.width` × `Register.height`).
+  COORDINATE_SPACE_PANEL = 1;
+  // Firmware logical pixels (`GfxRenderer` width × height). The simulator
+  // converts to panel using the current UI orientation.
+  COORDINATE_SPACE_LOGICAL = 2;
+}
+
 // Inject a touch edge or a tap on the panel.
 message InjectTouch {
   // 0=down, 1=move, 2=up, 3=tap.
   uint32 kind = 1;
-  // Touch x in panel pixels.
+  // Touch x in `coordinate_space` pixels.
   uint32 x = 2;
-  // Touch y in panel pixels.
+  // Touch y in `coordinate_space` pixels.
   uint32 y = 3;
+  // Pixel space for x and y. Unset or PANEL means panel.
+  CoordinateSpace coordinate_space = 4;
 }
 
 // Inject a named device key.
@@ -115,16 +138,18 @@ message InjectHome {
 
 // Inject a swipe as down at start, travel, and up at end.
 message InjectSwipe {
-  // Start x in panel pixels.
+  // Start x in `coordinate_space` pixels.
   uint32 start_x = 1;
-  // Start y in panel pixels.
+  // Start y in `coordinate_space` pixels.
   uint32 start_y = 2;
-  // End x in panel pixels.
+  // End x in `coordinate_space` pixels.
   uint32 end_x = 3;
-  // End y in panel pixels.
+  // End y in `coordinate_space` pixels.
   uint32 end_y = 4;
   // Duration of the swipe in milliseconds.
   uint32 duration_ms = 5;
+  // Pixel space for start and end. Unset or PANEL means panel.
+  CoordinateSpace coordinate_space = 6;
 }
 
 // Enable or disable remote inject on the simulator.
@@ -223,6 +248,21 @@ message SetSessionView {
   // Paths are SimToServer payload names (register, heartbeat, snapshot,
   // log, input_observed, and the other oneof members).
   google.protobuf.FieldMask read_mask = 1;
+  // Firmware log `component` names to omit (for example MEM or SCT).
+  // Empty means emit every component. Applied only to LogLine payloads.
+  repeated string exclude_log_components = 2;
+}
+
+// Outcome of an inject after the panel had a chance to paint.
+// Echoes ServerToSim.corr. painted is true when framebuffer_generation
+// increased after the inject was queued; false after a short miss timeout.
+message UiResult {
+  // True when the framebuffer generation increased after the inject.
+  bool painted = 1;
+  // Framebuffer generation when this result was decided.
+  uint64 generation = 2;
+  // Last known activity name at decide time. Empty if none yet.
+  string activity = 3;
 }
 
 // One classifiable log line from the simulator.

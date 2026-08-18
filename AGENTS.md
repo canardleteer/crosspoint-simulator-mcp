@@ -44,18 +44,25 @@ Streamable HTTP instead, mounted at `/mcp`. The gRPC `Session`
 listener stays up either way. The simulator is not an MCP peer.
 
 Inject tools (`touch` / `key` / `home` / `swipe`) wait for a corr-matched
-`InputAck` by default. `request_snapshot` waits for `SnapshotFrame` or
-`SnapshotError` and returns MCP image content. Pass `wait: false` to
-enqueue only. `SetInjectEnabled`, `SetSessionView`, and
+`UiResult` by default (`wait_mode=paint`). Pass `wait_mode=ack` for
+`InputAck`, or `wait: false` to enqueue only. Touch and swipe
+coordinates default to logical pixels; pass `space=panel` for
+framebuffer pixels. `inject_batch` runs those injects sequentially and
+stops on the first rejection. `request_snapshot` waits for `SnapshotFrame` or
+`SnapshotError` and returns MCP image content. `SetInjectEnabled`, `SetSessionView`, and
 `ShutdownRequest` stay fire-and-forget. `observe` drains inbound and
 honors the last `SetSessionView.read_mask` (SimToServer payload names:
 `register`, `heartbeat`, `snapshot`, `snapshot_error`, `log`,
-`input_ack`, `input_observed`, `goodbye`). An empty mask emits
-everything. Optional `until_log` and `until_generation_gt` wait until
-any condition matches or `wait_ms` elapses (`--observe-wait-ms` /
-`CSM_OBSERVE_WAIT_MS` when `wait_ms` is omitted). Corr waiters still
-complete if the mask excludes that payload. Instance ids stay required
-as above.
+`input_ack`, `input_observed`, `goodbye`, `ui_result`). An empty mask emits
+everything. `exclude_log_components` drops those `LogLine` components
+(for example `MEM`, `SCT`). Optional `until_log`, `until_activity`,
+`until_progress_page`, and `until_generation_gt` wait until any
+condition matches or `wait_ms` elapses (`--observe-wait-ms` /
+`CSM_OBSERVE_WAIT_MS` when `wait_ms` is omitted). `until_generation_gt`
+`0` means the current `lastHeartbeat.framebufferGeneration`. `matched`
+and `timedOut` are omitted unless an until-condition was set. Corr
+waiters still complete if the mask excludes that payload. Instance ids
+stay required as above.
 
 When testing CrossPoint Reader in the simulator over MCP, read
 [`.agents/skills/navigating-as-an-agent/SKILL.md`](.agents/skills/navigating-as-an-agent/SKILL.md).
